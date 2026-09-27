@@ -1,0 +1,8 @@
+xtulator/android/bin
+xtulator/android/gen
+xtulator/android/obj
+xtulator/android/libs
+*.apk
+*.o
+*.img
+*.bin

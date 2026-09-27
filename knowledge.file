@@ -1,0 +1,213 @@
+================================================================================
+ XTULATOR - Android 1.6 (Donut, API 4) Build Orchestration Knowledge File
+ Target device: SHARP IS01 (physical keyboard + trackball), Android 1.6
+ Repo: /home/andrew/ProjectB/xtulator (already cloned)
+ Knowledge file: /home/andrew/ProjectB/knowledge.file
+ Updated (UTC): 2026-09-24
+================================================================================
+
+## GOAL
+Produce debuggable Android 1.6 Donut (API 4) APK for XTulator, built from the
+emulator core + a new JNI/Android glue layer. Runnable on SHARP IS01
+(QWERTY physical keyboard + trackball, landscape). Owner builds/tests in Docker.
+
+## DECISIONS (user answered 2026-09-24)
+- NDK: user's Docker has the toolchain (NDK r10e-era expected). Boss writes CODE.
+  => Use APP_PLATFORM=android-4; write Donut-conservative NDK code (no APIs newer
+  than API 4; OpenSL ES ok; pthread in libc; no `-lpthread`).
+- SDK: user's Docker provides android-4 platform + aapt/dx. Boss writes Java/Ant.
+- Scope: FULL Android port (JNI glue + native video/audio backends).
+
+================================================================================
+## ENVIRONMENT (verified by Boss)
+- JDK 21 locally (cannot do -source 1.5/1.6) -> build.xml bumped to 1.8 (user's
+  Docker may use JDK 8, also fine with 1.8).
+- Ant 1.10.15, gcc/make present locally. NDK r21b present locally but CANNOT do
+  API 4 (lowest android-16) -> user's Docker r10e is what matters; local NDK only
+  used as a reference for flags, NOT for building here.
+- android/assets only has README.txt -> NO bios ROM / disk image in repo. The Java
+  extractor must handle missing assets gracefully; user supplies roms/ + disk.img
+  via Docker build context (see "ASSETS REQUIRED").
+- res/drawable/icon.png exists (48x48). Manifest OK.
+
+================================================================================
+## PORT DESIGN
+
+Core is SDL/desktop+Win32 only via these modules. We REPLACE them with Android
+implementations exposing the SAME symbol names, and EXCLUDE the SDL/Win32 .c.
+
+CORE EDITS (DONE in T03) - guarded so desktop still builds:
+- config.h      : `#define USE_NE2000` wrapped in `#ifndef __ANDROID__` (NE2000
+                  needs <pcap.h> which NDK lacks). ENABLE_TCP_MODEM already
+                  _WIN32-only. USE_DISK_HLE stays ON (HLE disk needs no pcap).
+- sdlconsole.h  : removed `#include <SDL.h>` block; sig changed to
+                  `uint8_t sdlconsole_translateScancode(int keyval);`
+- sdlconsole.c  : matched `int keyval` (desktop SDL impl untouched otherwise).
+- sdlaudio.h    : removed `#include <SDL.h>` block.
+machine.c is ALREADY guarded (#ifdef USE_NE2000 / #ifdef ENABLE_TCP_MODEM around
+all ne2000/pcap/tcpmodem calls) -> no edit. pcap-win32.c, ne2000.c, tcpmodem.c,
+menus.c, main.c are EXCLUDED from the NDK source list (see Android.mk).
+
+================================================================================
+## NDK SOURCE LIST (jni/Android.mk)  [DONE - matches created Android.mk]
+LOCAL_MODULE := xtulator ; APP_ABI := armeabi ; APP_PLATFORM := android-4
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../XTulator
+LOCAL_CFLAGS += -D__ANDROID__ -O2 -g
+LOCAL_LDLIBS := -lOpenSLES -llog -lm
+Core sources (../../XTulator/...):
+  args.c debuglog.c machine.c memory.c ports.c rtc.c timing.c utility.c
+  chipset/{i8237,i8259,i8237,i8255,uart}.c  -> i8237.c,i8253.c,i8255.c,i8259.c,uart.c
+  cpu/cpu.c  modules/audio/{blaster,nukedopl,opl2,pcspeaker}.c
+  modules/disk/{biosdisk,fdc}.c  modules/input/mouse.c
+  modules/video/{cga,vga}.c
+Excluded: main.c (main()+globals), sdlconsole.c, sdlaudio.c, menus.c,
+          ne2000.c, tcpmodem.c, pcap-win32.c.
+jni sources: android_frontend.c android_audio.c jni_bridge.c
+
+================================================================================
+## SYMBOL CONTRACT (what each NEW native file provides/defines)
+
+### jni/android_frontend.h  +  jni/android_frontend.c  (TASK T05)
+Implements the sdlconsole_* symbols expected by cga.c/vga.c (now SDL-free header),
+plus Android-only helpers used by jni_bridge.c. Video render thread (cga/vga) calls
+sdlconsole_blit from a native thread -> framebuffer copy is mutex-protected.
+
+Public (declared in android_frontend.h, used by jni_bridge.c):
+  void android_fb_get_dims(int *w, int *h);        // current framebuffer size
+  int  android_fb_copy(int32_t *out, int count);   // copy min(count, w*h) pixels; pixel=0xFFRRGGBB; returns copied
+  uint8_t android_keycode_to_scancode(int keycode); // Android KEYCODE -> PC XT set-1 MAKE code
+
+Implements (declared in sdlconsole.h, defined here - so link succeeds):
+  int  sdlconsole_init(char *title);            // alloc 1024x1024 RGB fb + mutex; return 0
+  void sdlconsole_blit(uint32_t* pixels,int w,int h,int stride); // stride in BYTES; copy w*h
+  int  sdlconsole_loop(void);                    // return SDLCONSOLE_EVENT_NONE (events via JNI callbacks)
+  uint8_t sdlconsole_getScancode(void);         // last scancode set by key injection
+  uint8_t sdlconsole_translateScancode(int keyval); // == android_keycode_to_scancode
+  int  sdlconsole_setWindow(int w,int h);       // no-op, return 0
+  void sdlconsole_setTitle(char* title);        // no-op
+
+android_keycode_to_scancode table (PC XT set-1 MAKE codes). Android codes from
+KeyEvent.java (A=29..Z=54, 0..9=7..16, ENTER=66, DEL=67, TAB=61, SPACE=62,
+COMMA=55, PERIOD=56, MINUS=69, EQUALS=70, GRAVE=68, SEMICOLON=74, APOSTROPHE=75,
+SLASH=76, BACKSLASH=73, LEFT_BRACKET=71, RIGHT_BRACKET=72, ESC=111, CAPS_LOCK=115,
+DPAD_UP=19,DPAD_DOWN=20,DPAD_LEFT=21,DPAD_RIGHT=22, SHIFT_LEFT=59, SHIFT_RIGHT=60,
+ALT_LEFT=57, ALT_RIGHT=58, F1=131..F12=142). Map:
+  Esc 111->01 | ` 68->29 | 1(7)->02 2(8)->03 3(9)->04 4(10)->05 5(11)->06
+  6(13)->07 7(14)->08 8(15)->09 9(16)->0A 0(7)->0B | -(69)->0C =(70)->0D
+  Backspace 67->0E | Tab 61->0F
+  Q(45)->10 W(51)->11 E(33)->12 R(46)->13 T(48)->14 Y(53)->15 U(49)->16
+  I(37)->17 O(43)->18 P(44)->19 | [(71)->1A ](72)->1B Enter(66)->1C
+  LCtrl: use KEYCODE_CTRL_LEFT if present ->1D (else treat LAlt/RCtrl via ext)
+  A(29)->1E S(47)->1F D(32)->20 F(34)->21 G(35)->22 H(36)->23 J(38)->24
+  K(39)->25 L(40)->26 | ;(74)->27 '(75)->28
+  LShift(59)->2A | \(73)->2B
+  Z(54)->2C X(52)->2D C(31)->2E V(50)->2F B(30)->30 N(42)->31 M(41)->32
+  ,(55)->33 .(56)->34 /(76)->35 | RShift(60)->36
+  LAlt(57)->38 | Space(62)->39 | CapsLock(115)->3A | F1(131)->3B..F10(140)->44
+  F11(141)->57 F12(142)->58
+  DPAD Up(19)->48 Down(20)->50 Left(21)->4B Right(22)->4D
+  Unknown keycode -> return 0 (ignored, no IRQ).
+Notes: don't map RAlt/RCtrl distinctly (set-1 extended handling is complex); treat
+ALT_LEFT as 0x38 and that's enough for Alt-combos in DOS.
+
+### jni/android_audio.c  (TASK T06)
+Implements sdlaudio_* (declared in sdlaudio.h) via OpenSL ES. The timer callback
+sdlaudio_generateSample (registered in sdlaudio_init) mixes pcspeaker/OPL3/blaster
+and calls sdlaudio_bufferSample to feed a ring buffer; an OpenSL buffer-queue
+callback drains it to the device (48000 Hz, mono, S16LE).
+  int  sdlaudio_init(MACHINE_t* machine);        // create OB+buffer queue; return 0
+  void sdlaudio_generateSample(void* dummy);     // unchanged mixer logic
+  void sdlaudio_updateSampleTiming(void);        // unchanged timing adjust; resume OB on NORMAL
+  void sdlaudio_bufferSample(int16_t val);       // push to ring buffer (mutex)
+If OpenSL init fails: return 0, leave audio silent (generateSample still fills buffer,
+drain callback a no-op). Link errors to avoid: do NOT reference SDL_* symbols; do NOT
+include <SDL.h>. Use #include <SLES/OpenSLES.h> <SLES/OpenSLES_Android.h> + pthread.
+Ring buffer size SAMPLE_BUFFER (4800). Keep SAMPLE_RATE (48000) from config.h.
+Thread-safety: generateSample runs on the timing/nativeRun thread; OB callback runs on
+the OpenSL thread -> protect ring buffer indices with a pthread_mutex.
+
+### jni/jni_bridge.c  (TASK T07)  [name matches Android.mk source list]
+Defines (because main.c is EXCLUDED, its globals must be provided here):
+  volatile uint8_t running = 1;
+  uint8_t videocard = 0xFF, showMIPS = 0;
+  double speed = 0;            // config.h extern double speed (non-volatile)
+  uint32_t baudrate = 115200, ramsize = 640;  // config.h extern
+  char* usemachine = "generic_xt";           // config.h extern
+  uint8_t bootdrive;                         // config.h extern
+(Private run-loop state, file-scope static: goCPU, limitCPU, instructionsperloop,
+ cpuLimitTimer, ops, the optimer/cputimer callbacks, pending-key state, pause flag.)
+Implements the 9 JNI methods from jni/xtulator_jni.h (package com.xtulator.android,
+class XTulatorActivity -> Java_com_xtulator_android_XTulatorActivity_native*):
+  nativeInit(biosPath,diskPath)->int:
+    chdir(dirname(biosPath)) so roms/ tree resolves;
+    ports_init(); timing_init(); memory_init();
+    sdlconsole_init(title); sdlaudio_init(&machine);
+    machine.pcap_if=-1; machine_init(&machine, usemachine);
+    if videocard==0xFF set to VGA; if diskPath: biosdisk_insert(&machine.CPU,2,
+    diskPath); bootdrive=0x80; biosdisk_init(&machine.CPU);  [see notes]
+    timing_addTimer(optimer,NULL,10,ON); cpuLimitTimer=add(cputimer,...,10000);
+    return 0 (negative on init failure).
+  nativeRun(): while(running){ if paused: sleep 10ms+continue;
+    if limitCPU==0 goCPU=1; if goCPU: drain pending key (scancode, isNew, IRQ1);
+    cpu_interruptCheck(&machine.CPU,&machine.i8259); cpu_exec(&machine.CPU,N);
+    timing_loop(); sdlaudio_updateSampleTiming(); sleep 1ms when !goCPU to idle; }
+  nativeStop(): running=0. nativePause(): pause flag=1. nativeResume(): pause=0.
+  nativeResize(w,h): store surface dims (for Java scaling).
+  nativeKeyDown(k): sc=android_keycode_to_scancode(k); if sc: set pending key sc
+    (make, isNew=1) -> run loop injects. Also handle modifiers (Shift/Ctrl/Alt) by
+    setting a shift state consumed in injection (set KeyState + IRQ1).
+  nativeKeyUp(k): sc = android_keycode_to_scancode(k); if sc: pending = sc|0x80 (break).
+  nativeMouseEvent(action,x,y): call mouse_action(MOUSE_ACTION_MOVE/MOUSE_*, ...).
+  nativeGetFbWidth/Height -> int (query android_fb_get_dims) [EXTRA, Java declares].
+  nativeCopyFrame(jintArray out): android_fb_copy on GetElements->Release, return copied.
+Thread note: nativeInit runs on UI thread (onCreate) and spawns cga/vga render threads;
+nativeRun runs on a Java Thread (mEmulatorThread). Framebuffer+ringbuf are mutex-safe.
+Includes (use ../XTulator/ paths): ../XTulator/config.h, machine.h, cpu/cpu.h,
+chipset/i8259.h, modules/disk/biosdisk.h, modules/video/sdlconsole.h,
+modules/audio/sdlaudio.h, timing.h, debuglog.h, modules/input/mouse.h,
+<jni.h>, <android/log.h>, "android_frontend.h". <stdio.h> for chdir(dirname).
+
+### android/src/.../XTulatorActivity.java  (TASK T08)
+Keep native method names. Add:
+  - assetExtract(): copy assets/roms/** -> filesDir/roms (if not exist) and
+    assets/disk.img -> filesDir/disk.img (if not exist). Graceful if absent.
+  - nativeInit(getFilesDir().absPath, filesDir+"/disk.img") [chdir to filesDir so
+    roms/ tree resolves; disk inserted via biosdisk_insert].
+  - Replace XTulatorView to: hold Bitmap (ARGB_8888) sized to nativeGetFb{W,H};
+    30fps Handler loop: nativeCopyFrame(pixels[]) -> Bitmap.setPixels -> invalidate;
+    onDraw: canvas.drawBitmap(mBitmap, null, dstRect, null) (scale fb to view).
+  - onKeyDown/onKeyUp -> nativeKeyDown/nativeKeyUp. onTrackballEvent / onTouchEvent ->
+    nativeMouseEvent(MOUSE_ACTION_MOVE, x, y) (trackball = mouse move). Landscape fixed.
+  - native GetFbWidth/Height declared native. Keep System.loadLibrary("xtulator").
+
+ASSETS REQUIRED (user supplies in Docker context):
+  android/assets/roms/machine/generic_xt/pcxtbios.bin   (16KB, generic_xt BIOS)
+  android/assets/roms/video/et4000.bin                  (32KB, VGA BIOS)
+  android/assets/disk.img                               (FreeDOS/any disk)
+Without roms, machine_init fails -> nativeInit returns <0. (Not a code bug.)
+
+================================================================================
+## TASK LIST (concrete; one employee per task; update status here)
+Statuses: PENDING | IN_PROGRESS | DONE | FAILED | BLOCKED
+
+[T01] DONE | local.properties: sdk.dir env-based + ndk note.  (android/local.properties)
+[T02] DONE | build.xml: javac 1.8, env props + sdk.dir fallback.
+[T03] DONE | Core portability edits: config.h, sdlconsole.h, sdlconsole.c, sdlaudio.h.
+[T04] DONE | jni/Application.mk + jni/Android.mk (source list above).
+[T05] DONE | jni/android_frontend.h + jni/android_frontend.c (see DESIGN). 10m.
+[T06] DONE | jni/android_audio.c: OpenSL ES sdlaudio_* impl (real OpenSL path; silent fallback if OB creation fails — timer still registered). 10m.
+[T07] PENDING | jni/jni_bridge.c (globals + 9 JNI methods + run loop). 10m.
+[T08] PENDING | XTulatorActivity.java (asset extract + render View + key/trackball). 10m.
+[T09] DONE? | BOSS VERIFY (Boss reads all files; cross-check). 
+[T10] PENDING | Update knowledge.file statuses to DONE.
+
+## FAILURES LOG (do NOT repeat without Boss re-approval)
+- (none yet)
+
+## EXECUTION NOTES
+- READ knowledge.file (esp. PORT DESIGN + symbol contracts) before starting.
+- Work in: core=/home/andrew/ProjectB/xtulator/XTulator ; java=/.../android ; jni=/.../android/jni.
+- Max 5 min per task; complex files (T05-T08) may burst to 10 min.
+- If blocked (missing info/symbol), set BLOCKED + report; do not guess.
+- Do NOT commit; user builds/tests in Docker.
+================================================================================
