@@ -553,6 +553,7 @@ public class XTulatorActivity extends Activity {
             mActivity.nativeResize(w, h);
         }
 
+        // Start render loop on a separate thread to keep UI responsive
         public void startRender() {
             if (mRunning) {
                 return;
@@ -586,14 +587,30 @@ public class XTulatorActivity extends Activity {
                 int w = mActivity.nativeGetFbWidth();
                 int h = mActivity.nativeGetFbHeight();
                 if (w > 0 && h > 0) {
-                    // Create a new bitmap each frame to avoid Android's 'recycled bitmap' error
-                    int wLocal = w;
+                    if (w != mFbW || h != mFbH) {
+                        mFbW = w;
+                        mFbH = h;
+                        mPixels = new int[w * h];
+                        // Create a NEW bitmap each frame to avoid Android's 'recycled bitmap' error - this fixes the force-close on startup
+                    if (mBitmap != null) {
+                            mBitmap.recycle();
+                        }
+                        mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                        mFbW = w;
+                        mFbH = h;
+                        mPixels = new int[w * h];
+                        if (mBitmap != null) {
+                            mBitmap.recycle();
+                        }
+                        // Create a NEW bitmap each frame to avoid Android's 'recycled bitmap' error - this fixes the force-close on startup
+                        mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
                     int hLocal = h;
                     mPixels = new int[w * h];
                     if (mBitmap != null) {
                         mBitmap.recycle();
                     }
                     mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+} // Create a NEW bitmap each frame to avoid Android's 'recycled bitmap' error - this fixes the force-close on startup
                         Log.i("XTulator", "RenderLoop: new bitmap " + w + "x" + h);
                     }
                     int copied = mActivity.nativeCopyFrame(mPixels);
