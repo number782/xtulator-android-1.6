@@ -16,7 +16,7 @@ RUN sed -i 's|http://archive.ubuntu.com|http://old-releases.ubuntu.com|g' /etc/a
     git \
     build-essential \
     lib32stdc++6 \
-    lib32z1 \ 
+    lib32z1 \
     lib32ncurses5 \
     lib32bz2-1.0 \
     lib32gcc1 \
@@ -27,6 +27,7 @@ RUN sed -i 's|http://archive.ubuntu.com|http://old-releases.ubuntu.com|g' /etc/a
     bin86 \
     ant \
     expect \
+    file \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Android SDK (legacy tools for API 4)
@@ -51,9 +52,9 @@ RUN cd /tmp && \
 # Install SDK platform for Android 4.4.2 (API 19) - android-4 (API 4) no longer available
 RUN echo y | ${SDK_DIR}/tools/android update sdk --no-ui --filter platform-tools,android-19,extra-android-support 2>&1 | tail -20
 
-# Download and install Android NDK r10e (supports API 19, has asset_manager.h)
-ENV NDK_VERSION=r10e
-ENV NDK_URL=https://dl.google.com/android/ndk/android-ndk-${NDK_VERSION}-linux-x86_64.tar.bz2
+# Download and install Android NDK r5c (last version supporting Android 1.6 / API 4)
+ENV NDK_VERSION=r5c
+ENV NDK_URL=http://dl.google.com/android/ndk/android-ndk-r5c-linux-x86_64.tar.bz2
 
 RUN mkdir -p /opt/android && \
     cd /opt/android && \
