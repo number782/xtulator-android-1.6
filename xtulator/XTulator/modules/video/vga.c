@@ -111,6 +111,7 @@ int vga_init() {
 	for (i = 0; i < 4; i++) { //4 planes of 64 KB (It's actually 64K addresses on a 32-bit data bus on real VGA hardware)
 		vga_RAM[i] = (uint8_t*)malloc(65536);
 		if (vga_RAM[i] == NULL) break;
+		memset(vga_RAM[i], 0, 65536); //clear all planes
 	}
 	if (i < 4) { //If there was an allocation error
 		for (; i >= 0; i--) { //step back through any successfully allocated chunks
@@ -118,6 +119,54 @@ int vga_init() {
 		}
 		return -1;
 	}
+
+	/* Enable CPU access to video RAM. Bit 1 of Misc Output Register
+	   enables writes to 0xA0000; without it, all VGA memory writes are blocked.
+	   Bit 0 = 0 selects color mode (ports 0x3B4/0x3B5), bit 1 = 1 enables RAM access. */
+	vga_misc = 0x62;
+
+	/* Load a built-in 8x16 font into plane 2 as a fallback.
+	   Each character occupies 32 bytes (16 scanlines x 2 bytes/scanline for word alignment).
+	   Fill with 0xFF so characters are visibly rendered even if BIOS font loading is incomplete. */
+	for (i = 0; i < 256 * 32; i++) {
+		vga_RAM[2][i] = 0xFF;
+	}
+
+	/* Initialize default VGA 16-color palette (8-bit RGB values) */
+	{
+		static const uint8_t vga_defpal[16][3] = {
+			{   0,   0,   0 }, /* 0: black */
+			{   0,   0, 168 }, /* 1: blue */
+			{   0, 168,   0 }, /* 2: green */
+			{   0, 168, 168 }, /* 3: cyan */
+			{ 168,   0,   0 }, /* 4: red */
+			{ 168,   0, 168 }, /* 5: magenta */
+			{ 168,  84,   0 }, /* 6: brown */
+			{ 168, 168, 168 }, /* 7: light gray */
+			{  84,  84,  84 }, /* 8: dark gray */
+			{  84,  84, 252 }, /* 9: light blue */
+			{  84, 252,  84 }, /* 10: light green */
+			{  84, 252, 252 }, /* 11: light cyan */
+			{ 252,  84,  84 }, /* 12: light red */
+			{ 252,  84, 252 }, /* 13: light magenta */
+			{ 252, 252,  84 }, /* 14: yellow */
+			{ 252, 252, 252 }, /* 15: white */
+		};
+		for (i = 0; i < 16; i++) {
+			vga_palette[i][0] = vga_defpal[i][0];
+			vga_palette[i][1] = vga_defpal[i][1];
+			vga_palette[i][2] = vga_defpal[i][2];
+		}
+	}
+
+	/* Default text-mode registers so writes produce visible output
+	   before BIOS fully programs VGA. */
+	vga_gfxd[0x05] = 0x10;  /* odd/even host mode = text mode */
+	for (i = 0; i < 16; i++) {
+		vga_attrd[i] = i;   /* identity palette mapping */
+	}
+	vga_attrd[0x10] = 0x01; /* text mode enable */
+	vga_attrd[0x14] = 0x00; /* use palette registers 0-15 */
 
 	//Initialize CRTC registers with standard VGA text-mode defaults (80x25, 720x400)
 	//so vertical retrace timing is generated even before the BIOS programs the CRTC
@@ -207,35 +256,7 @@ void vga_updateScanlineTiming() {
 	}
 }
 
-static int test_frame = 0;
-
 void vga_update(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end_y) {
-	// TEST: Draw a simple test pattern if framebuffer is empty
-	test_frame++;
-	VGA_LOGI("vga_update: ENTRY test_frame=%d", test_frame);
-	
-	// Check if framebuffer is all zeros (first 100 pixels)
-	int all_zero = 1;
-	for (int i = 0; i < 100; i++) {
-		if (vga_framebuffer[i][0] != 0) {
-			all_zero = 0;
-			break;
-		}
-	}
-	
-	if (all_zero && test_frame < 10) {
-		VGA_LOGI("vga_update: framebuffer empty, drawing test pattern (frame %d)", test_frame);
-		// Draw vertical color bars
-		for (int y = 0; y < 400; y++) {
-			for (int x = 0; x < 640; x++) {
-				uint8_t color = (x * 16) / 640;  // 16 color bars
-				vga_framebuffer[y][x] = vga_color(color);
-			}
-		}
-		VGA_LOGI("vga_update: TEST PATTERN DRAWN, first pixel=%08X", vga_framebuffer[0][0]);
-		return;
-	}
-
 	uint32_t addr, startaddr, cursorloc, cursor_x, cursor_y, fontbase, color32;
 	uint32_t scx, scy, x, y, hchars, divx, yscanpixels, xscanpixels, xstride, bpp, pixelsperbyte, shift;
 	uint8_t cc, attr, fontdata, blink, mode, colorset, intensity, blinkenable, cursorenable, dup9;
@@ -586,7 +607,6 @@ void vga_writeport(void* dummy, uint16_t port, uint8_t value) {
 		vga_DAC.step = 0;
 		break;
 	case 0x3C9:
-		//debug_log(DEBUG_DETAIL, "write pal %u = %02X\r\n", vga_DAC.index, value & 0x3F);
 		vga_DAC.pal[vga_DAC.index][vga_DAC.step++] = value & 0x3F;
 		if (vga_DAC.step == 3) {
 			vga_palette[vga_DAC.index][0] = vga_DAC.pal[vga_DAC.index][0] << 2;

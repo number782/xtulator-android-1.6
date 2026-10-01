@@ -19,7 +19,7 @@
 #include "../XTulator/chipset/i8259.h"
 #include "../XTulator/chipset/i8253.h"
 #include "../XTulator/modules/disk/biosdisk.h"
-#include "../XTulator/modules/video/sdlconsole.h"
+#include "../XTulator/modules/video/vga.h"
 #include "../XTulator/modules/audio/sdlaudio.h"
 #include "../XTulator/modules/input/mouse.h"
 #include "../XTulator/timing.h"
@@ -53,13 +53,13 @@ MACHINE_t machine;
 static uint32_t optimer_ticks = 0;
 static int profile_watch = -1;
 static uint64_t pit_last_dump = 0;
-static uint32_t instructionsperloop = 100000, cpuLimitTimer;
-static volatile uint8_t goCPU = 1, limitCPU = 0, emu_paused = 0;
 /* When unthrottled (speed=0), run larger batches to reduce per-iteration
  * overhead (2× cpu_interruptCheck + timing_loop per batch). 1000 instructions
  * per batch gives ~10× better throughput than 100 while keeping key latency
  * well under the BIOS typematic rate. */
 #define UNTHROTTLED_BATCH 1000
+static uint32_t instructionsperloop = UNTHROTTLED_BATCH, cpuLimitTimer;
+static volatile uint8_t goCPU = 1, limitCPU = 0, emu_paused = 0;
 /* Ring buffer for key scancodes (press=0x00-0x7F, release=0x80-0xFF).
  * Size must be power of 2 for fast modulo. */
 #define KEYBUF_SIZE 16
@@ -244,7 +244,7 @@ JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeRun(	JNI
 		loop_count++;
 		if (loop_count % 200 == 0) {
 			LOGE("nativeRun: loop %u, IP=%04X:%04X, dynrec_exec=%u, native=%u",
-				loop_count, machine.CPU.segregs[regcs], machine.CPU.ip, 
+				loop_count, machine.CPU.segregs[regcs], machine.CPU.ip,
 				(unsigned)instructionsperloop, diag_count);
 		}
 		cpu_interruptCheck(&machine.CPU, &machine.i8259);
@@ -353,6 +353,7 @@ JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativePause(JN
 JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeResume(JNIEnv *env, jobject thiz) {
 	(void)env; (void)thiz;
 	LOGI("nativeResume: resuming emulation");
+	running = 1;
 	emu_paused = 0;
 	goCPU = 1;
 }
@@ -391,13 +392,54 @@ JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetDynre
 }
 
 JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeCopyFrame(JNIEnv *env, jobject thiz, jintArray out) {
-	(void)env; (void)thiz;
+	(void)thiz;
 	jint* buf = (*env)->GetIntArrayElements(env, out, NULL);
-	if (buf != NULL) {
-		android_fb_copy((int32_t*)buf, (*env)->GetArrayLength(env, out));
-		(*env)->ReleaseIntArrayElements(env, out, buf, 0);
+	if (buf == NULL) {
+		return 0;
 	}
-	return 0;
+	jsize len = (*env)->GetArrayLength(env, out);
+	jint result = (jint)android_fb_copy((int32_t*)buf, (int)len);
+	(*env)->ReleaseIntArrayElements(env, out, buf, 0);
+	return result;
+}
+
+JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetFbDims(JNIEnv *env, jobject thiz, jintArray dims) {
+	(void)env; (void)thiz;
+	jsize len = (*env)->GetArrayLength(env, dims);
+	if (len < 2) {
+		return;
+	}
+	int w, h;
+	android_fb_get_dims(&w, &h);
+	jint *arr = (*env)->GetIntArrayElements(env, dims, NULL);
+	if (arr != NULL) {
+		arr[0] = (jint)w;
+		arr[1] = (jint)h;
+		(*env)->ReleaseIntArrayElements(env, dims, arr, 0);
+	}
+}
+
+JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetFrame(JNIEnv *env, jobject thiz, jintArray dims, jintArray pixels) {
+	(void)thiz;
+	jsize dimsLen = (*env)->GetArrayLength(env, dims);
+	if (dimsLen < 2) {
+		return 0;
+	}
+	jint *pixBuf = (*env)->GetIntArrayElements(env, pixels, NULL);
+	if (pixBuf == NULL) {
+		return 0;
+	}
+	jsize pixLen = (*env)->GetArrayLength(env, pixels);
+	int w, h;
+	jint result = (jint)android_fb_get_dims_and_copy(&w, &h, (int32_t*)pixBuf, (int)pixLen);
+	(*env)->ReleaseIntArrayElements(env, pixels, pixBuf, 0);
+	jint *dimsArr = (*env)->GetIntArrayElements(env, dims, NULL);
+	if (dimsArr != NULL) {
+		dimsArr[0] = (jint)w;
+		dimsArr[1] = (jint)h;
+		(*env)->ReleaseIntArrayElements(env, dims, dimsArr, 0);
+	}
+	return result;
 }
 
 JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeReset(JNIEnv *env, jobject thiz) {

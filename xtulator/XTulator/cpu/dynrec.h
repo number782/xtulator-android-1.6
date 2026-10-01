@@ -12,7 +12,7 @@ void dynrec_invalidate_range(uint32_t start, uint32_t len);
 void dynrec_enable(void);  /* enable dynrec at runtime */
 void dynrec_disable(void);
 
-extern int dynrec_enabled;
+extern volatile int dynrec_enabled;
 
 /* Dynrec statistics */
 extern volatile uint32_t dynrec_native_blocks;

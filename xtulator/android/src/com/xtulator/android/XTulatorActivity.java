@@ -52,6 +52,8 @@ public class XTulatorActivity extends Activity {
     public native void nativeResume();
     public native int nativeGetFbWidth();
     public native int nativeGetFbHeight();
+    public native void nativeGetFbDims(int[] dims);
+    public native int nativeGetFrame(int[] dims, int[] pixels);
     public native int nativeGetSpeedPct();
     public native int nativeGetDynrecNativeBlocks();
     public native int nativeGetDynrecInterpreterInstrs();
@@ -67,6 +69,7 @@ public class XTulatorActivity extends Activity {
     private static final int TRACE_INTERRUPTS = 0x10;
     private static final int TRACE_DISK     = 0x04;
     private static final int TRACE_MISC     = 0x40;
+    private static final int TRACE_VIDEO    = 0x20;
     /** JNI call to toggle a single trace category bit in the native core. */
     public native void nativeSetTraceFlag(int flag, boolean enabled);
     public native void nativeEnableDynrec(boolean enable);
@@ -79,7 +82,7 @@ public class XTulatorActivity extends Activity {
     private boolean mTraceInterrupts = false;
     private boolean mTraceDisk = false;
     private boolean mTraceMisc = false;
-    private boolean         mDynrecEnabled = true;
+    private boolean         mDynrecEnabled = false;
     private AudioTrack mAudioTrack = null;
     private Thread mAudioFlushThread = null;
     private volatile boolean mAudioRunning = false;
@@ -246,8 +249,9 @@ public class XTulatorActivity extends Activity {
         mTraceMisc = true; /* Enable by default for debugging */
         nativeSetTraceFlag(TRACE_MISC, true);
         nativeSetTraceFlag(0x80, false); /* TRACE_FLAG_DIAG — disabled for performance */
-        mDynrecEnabled = true; /* Enable dynrec for debugging */
-        nativeEnableDynrec(mDynrecEnabled);
+        nativeSetTraceFlag(TRACE_VIDEO, false); /* Disable video trace to avoid logflood */
+        mDynrecEnabled = prefs.getBoolean("dynrec", false);
+        nativeEnableDynrec(mDynrecEnabled); /* Dynrec disabled by default — enable via menu */
         Log.i("XTulator", "Restored trace settings: cpu=" + mTraceCpu + " keyboard=" + mTraceKeyboard
               + " interrupts=" + mTraceInterrupts + " disk=" + mTraceDisk + " misc=" + mTraceMisc
               + " showSpeed=" + mShowSpeed);
@@ -529,7 +533,9 @@ public class XTulatorActivity extends Activity {
     }
 
 
+
     private static class XTulatorView extends View {
+        private static final int FB_MAX_PIXELS = 1024 * 1024;
         private final XTulatorActivity mActivity;
         private volatile boolean mRunning = false;
         private Thread mRenderThread;
@@ -553,7 +559,6 @@ public class XTulatorActivity extends Activity {
             mActivity.nativeResize(w, h);
         }
 
-        // Start render loop on a separate thread to keep UI responsive
         public void startRender() {
             if (mRunning) {
                 return;
@@ -580,49 +585,40 @@ public class XTulatorActivity extends Activity {
             }
         }
 
-
         private void renderLoop() {
+            int[] dims = new int[2];
+            if (mPixels == null) {
+                mPixels = new int[FB_MAX_PIXELS];
+            }
             int frameCount = 0;
             while (mRunning) {
-                int w = mActivity.nativeGetFbWidth();
-                int h = mActivity.nativeGetFbHeight();
-                if (w > 0 && h > 0) {
-                    if (w != mFbW || h != mFbH) {
-                        mFbW = w;
-                        mFbH = h;
-                        mPixels = new int[w * h];
-                        // Create a NEW bitmap each frame to avoid Android's 'recycled bitmap' error - this fixes the force-close on startup
-                    if (mBitmap != null) {
-                            mBitmap.recycle();
-                        }
-                        mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                        mFbW = w;
-                        mFbH = h;
-                        mPixels = new int[w * h];
-                        if (mBitmap != null) {
-                            mBitmap.recycle();
-                        }
-                        // Create a NEW bitmap each frame to avoid Android's 'recycled bitmap' error - this fixes the force-close on startup
-                        mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                    int hLocal = h;
-                    mPixels = new int[w * h];
+                int copied = mActivity.nativeGetFrame(dims, mPixels);
+                int w = dims[0];
+                int h = dims[1];
+                if ((w != mFbW || h != mFbH) && w > 0 && h > 0
+                        && (w * (long) h) <= (long) FB_MAX_PIXELS
+                        && h >= 200) {
                     if (mBitmap != null) {
                         mBitmap.recycle();
                     }
                     mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-} // Create a NEW bitmap each frame to avoid Android's 'recycled bitmap' error - this fixes the force-close on startup
-                        Log.i("XTulator", "RenderLoop: new bitmap " + w + "x" + h);
-                    }
-                    int copied = mActivity.nativeCopyFrame(mPixels);
-                    if (copied > 0 && frameCount % 300 == 0) {
-                        Log.i("XTulator", "RenderLoop: copied " + copied + " pixels, frame " + frameCount + ", first pixel=" + String.format("0x%08X", mPixels[0]));
-                    }
-                    frameCount++;
-                    mBitmap.setPixels(mPixels, 0, w, 0, 0, w, h);
-                    postInvalidate();
-} // End of the 'w > 0 && h > 0' check block
-                    Log.i("XTulator", "RenderLoop: waiting for framebuffer, w=" + w + " h=" + h);
+                    mFbW = w;
+                    mFbH = h;
+                    Log.i("XTulator", "RenderLoop: new bitmap " + w + "x" + h);
                 }
+                if (mBitmap != null && mPixels != null && mFbW > 0 && mFbH > 0) {
+                    if (copied > 0 && frameCount % 300 == 0) {
+                        int firstPix = mPixels[0];
+                        int midPix = mPixels[(mFbW * mFbH) / 2];
+                        Log.i("XTulator", "RenderLoop: copied " + copied + " pixels, frame " + frameCount
+                                + " first=0x" + Integer.toHexString(firstPix)
+                                + " mid=0x" + Integer.toHexString(midPix)
+                                + " fbW=" + mFbW + " fbH=" + mFbH);
+                    }
+                    mBitmap.setPixels(mPixels, 0, mFbW, 0, 0, mFbW, mFbH);
+                    postInvalidate();
+                }
+                frameCount++;
                 try {
                     Thread.sleep(50);
                 } catch (InterruptedException e) {
@@ -631,18 +627,22 @@ public class XTulatorActivity extends Activity {
             }
             Log.i("XTulator", "RenderLoop: exiting");
         }
+
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            if (mBitmap != null && mFbW > 0 && mFbH > 0) {
+            Bitmap bitmap = mBitmap;
+            int fbW = mFbW;
+            int fbH = mFbH;
+            if (bitmap != null && fbW > 0 && fbH > 0) {
                 int vw = getWidth();
                 int vh = getHeight();
-                float scale = Math.min((float) vw / (float) mFbW, (float) vh / (float) mFbH);
-                int dw = Math.round(mFbW * scale);
-                int dh = Math.round(mFbH * scale);
+                float scale = Math.min((float) vw / (float) fbW, (float) vh / (float) fbH);
+                int dw = Math.round(fbW * scale);
+                int dh = Math.round(fbH * scale);
                 int l = (vw - dw) / 2;
                 int t = (vh - dh) / 2;
-                canvas.drawBitmap(mBitmap, null, new Rect(l, t, l + dw, t + dh), null);
+                canvas.drawBitmap(bitmap, null, new Rect(l, t, l + dw, t + dh), null);
                 if (mActivity.isShowSpeed()) {
                     if (mSpeedPaint == null) {
                         mSpeedPaint = new Paint();

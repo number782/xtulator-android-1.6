@@ -238,6 +238,25 @@ pthread_mutex_unlock(&g_fbMtx);
     return n;
 }
 
+int android_fb_get_dims_and_copy(int *w_out, int *h_out, int32_t *out, int count)
+{
+	if (w_out == NULL || h_out == NULL || out == NULL || g_fb == NULL || count <= 0) {
+		return 0;
+	}
+	pthread_mutex_lock(&g_fbMtx);
+	int w = g_fbW;
+	int h = g_fbH;
+	*w_out = w;
+	*h_out = h;
+	int total = w * h;
+	int n = count < total ? count : total;
+	for (int i = 0; i < n; i++) {
+		out[i] = (int32_t)(g_fb[i] | 0xFF000000u);
+	}
+	pthread_mutex_unlock(&g_fbMtx);
+	return n;
+}
+
 #ifdef __ANDROID__
 /*
 	Asset copying using JNI calls to Java's AssetManager API.

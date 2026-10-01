@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include "config.h"
 #include "cpu/cpu.h"
+#include "cpu/dynrec.h"
 #include "modules/video/cga.h"
 #include "modules/video/vga.h"
 #include "utility.h"
@@ -35,8 +36,13 @@ void (*memory_mapWriteCallback[MEMORY_RANGE])(void* udata, uint32_t addr, uint8_
 void* memory_udata[MEMORY_RANGE];
 
 void cpu_write(CPU_t* cpu, uint32_t addr32, uint8_t value) {
+	addr32 &= MEMORY_MASK;
 	if (memory_mapWrite[addr32] != NULL) {
 		*(memory_mapWrite[addr32]) = value;
+		/* Invalidate any dynarec blocks that may have been translated
+		 * from this address — writing to RAM can modify executable code
+		 * (e.g. boot sector load, program loading, self-modifying code). */
+		dynrec_invalidate_range(addr32, 1);
 	}
 	else if (memory_mapWriteCallback[addr32] != NULL) {
 		(*memory_mapWriteCallback[addr32])(memory_udata[addr32], addr32, value);

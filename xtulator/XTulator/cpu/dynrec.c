@@ -37,6 +37,7 @@
 #define DLOGI(...) do { if (trace_flags & TRACE_FLAG_DIAG) { __android_log_print(ANDROID_LOG_INFO, "XTulator-DYNREC", __VA_ARGS__); } } while (0)
 #else
 #define DLOGI(...)
+#define DBGLOG(...)
 #endif
 
 #ifdef __ARM_ARCH_5TE__
@@ -46,7 +47,7 @@
 #define MAX_BLOCKS         1024
 #define MAX_INSTRUCTIONS   128
 
-int dynrec_enabled = 0;
+volatile int dynrec_enabled = 0;
 
 /* ---- Code cache ---- */
 static uint8_t* code_cache_base = NULL;
@@ -140,12 +141,13 @@ static void emit_movw(int Rd, uint16_t imm) {
     if (hi == 0) {
         emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | lo);  /* MOV Rd, #lo */
     } else if (lo == 0) {
-        /* Encode hi << 8 using rotate: ROR 24 (rotate_imm=12) of imm8 */
-        emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | (12 << 7) | hi);  /* MOV Rd, #hi, LSL #8 */
+        /* Encode hi << 8 using rotate: ROR 24 (rotate_imm=12) of imm8.
+         * rotate_imm occupies bits [11:8]; imm8 occupies bits [7:0]. */
+        emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | (12 << 8) | hi);  /* MOV Rd, #hi, LSL #8 */
     } else {
         /* MOV Rd, #lo; ORR Rd, Rd, #hi << 8 */
         emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | lo);  /* MOV Rd, #lo */
-        emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | (12 << 7) | hi);  /* ORR Rd, Rd, #hi, LSL #8 */
+        emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | (12 << 8) | hi);  /* ORR Rd, Rd, #hi, LSL #8 */
     }
 }
 
@@ -183,7 +185,7 @@ static void emit_bl(uint32_t target_addr) {
          *   A+12: .word target_addr  → literal pool (never executed)
          * After BLX returns to A+8, B 0 is a NOP → continues at caller's next instr. */
         emit32(0xE59FC004);     /* LDR R12, [PC, #4] */
-        emit32(0xE12FFF3C);     /* BLX R12 */
+        emit32(0xE12FFF9C);     /* BLX R12 */
         emit32(0xEA000000);     /* B 0 (NOP) — skips over literal pool */
         emit32(target_addr);    /* literal pool entry */
         DLOGI("emit_bl: indirect call for target=0x%08X", target_addr);
@@ -329,7 +331,6 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
 
     /* Check if block cache is full */
     if (block_cache_count >= MAX_BLOCKS) {
-        DLOGI("translate_block: block cache full at x86_pc=0x%06X", x86_pc);
         return -1;
     }
 
@@ -923,7 +924,6 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         }
 
         if (emit32_failed) {
-            DLOGI("translate_block: emit32 failed at opcode 0x%02X offset=%d", opcode, offset);
             goto translate_fail;
         }
 
@@ -961,7 +961,6 @@ block_done:
 translate_fail:
     /* Restore code cache position to discard any partially emitted garbage */
     code_cache_pos = start_pos;
-    DLOGI("translate_block: failed, restored code_cache_pos to 0x%x", start_pos);
     return -1;
 }
 
@@ -1042,62 +1041,52 @@ int dynrec_exec(CPU_t* cpu, I8259_t* i8259, int max_instr) {
         uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
         block_entry_t* block = find_block(x86_pc);
 
-        if (block == NULL || block->x86_pc == 0) {
-            int result = translate_block(cpu, x86_pc, MAX_INSTRUCTIONS);
-            if (result < 0 || result == 0) {
-                /* Can't translate or empty block — use interpreter */
-                int batch = (max_instr - total_executed);
-                if (batch > 1000) batch = 1000;
-                DLOGI("dynrec_exec: falling back to cpu_exec with batch=%d at x86_pc=0x%06X", batch, x86_pc);
-                cpu_exec(cpu, batch);
-                dynrec_interpreter_instrs += batch;
-                total_executed += batch;
-                continue;
-            }
-            block = &block_cache[block_cache_count - 1];
-            DLOGI("dynrec_exec: new block stored: x86_pc=0x%06X, x86_len=%u, arm_offset=%u", block->x86_pc, block->x86_len, block->arm_offset);
-        }
-
-        /* Flush data cache to ensure generated code is visible to instruction cache */
-        __builtin___clear_cache(code_cache_base + block->arm_offset,
-                                code_cache_base + block->arm_offset + block->code_len);
-
-        /* Execute the translated block */
-        typedef void (*block_func_t)(CPU_t* cpu);
-        block_func_t func = (block_func_t)(code_cache_base + block->arm_offset);
-        DLOGI("dynrec_exec: executing ARM block at offset=0x%06X, x86_len=%u, code_cache_base=%p, func=%p", block->arm_offset, block->x86_len, code_cache_base, (void*)func);
-
-        /* Save IP before execution to detect if control flow modified it */
-        uint16_t ip_before = cpu->ip;
-        uint16_t expected_end_ip = (uint16_t)(cpu->ip + block->x86_len);
-
-        /* Execute the ARM block — cpu is passed as R0 (first arg per AAPCS) */
-        func(cpu);
-        dynrec_native_blocks++;
-        DLOGI("dynrec_exec: ARM block execution returned successfully (total native blocks: %llu)", (unsigned long long)dynrec_native_blocks);
-        DLOGI("dynrec_exec: block x86_len=%u, total_executed=%d, max_instr=%d", block->x86_len, total_executed, max_instr);
-
-        /* Guard against zero-length blocks (shouldn't happen, but prevents infinite loop) */
-        if (block->x86_len == 0) {
-            total_executed += 1;
+    if (block == NULL || block->x86_pc == 0) {
+        int result = translate_block(cpu, x86_pc, MAX_INSTRUCTIONS);
+        if (result < 0 || result == 0) {
+            /* Can't translate or empty block — use interpreter */
+            int batch = (max_instr - total_executed);
+            if (batch > 1000) batch = 1000;
+            cpu_exec(cpu, batch);
+            dynrec_interpreter_instrs += batch;
+            total_executed += batch;
             continue;
         }
+        block = &block_cache[block_cache_count - 1];
+    }
 
-        /* Advance IP for sequential execution. If a control-flow instruction
-           (JMP/CALL/RET/INT/Jcond) modified cpu->ip, don't override it. */
-        if (cpu->ip == ip_before) {
-            cpu->ip = expected_end_ip;
-        }
+    /* Flush data cache and invalidate instruction cache to ensure
+     * generated code is visible to the CPU. On ARMv5TE with Android,
+     * __builtin___clear_cache may not work reliably — use the
+     * cacheflush() syscall wrapper which issues the SWI directly. */
+    cacheflush((long)(code_cache_base + block->arm_offset),
+               (long)(code_cache_base + block->arm_offset + block->code_len),
+               0);
 
-        /* Check if CPU was halted or interrupted during execution */
-        if (cpu->hltstate || cpu->trap_toggle) {
-            /* Let the interrupt check handle it */
-            total_executed += block->x86_len;
-            continue;
-        }
+    /* Execute the translated block */
+    typedef void (*block_func_t)(CPU_t* cpu);
+    block_func_t func = (block_func_t)(code_cache_base + block->arm_offset);
 
+    uint16_t ip_before = cpu->ip;
+    uint16_t expected_end_ip = (uint16_t)(cpu->ip + block->x86_len);
+
+    func(cpu);
+    dynrec_native_blocks++;
+
+    if (cpu->ip == ip_before) {
+        cpu->ip = expected_end_ip;
+    }
+
+    if (cpu->ip == ip_before) {
+        cpu->ip = expected_end_ip;
+    }
+
+    if (cpu->hltstate || cpu->trap_toggle) {
         total_executed += block->x86_len;
-        DLOGI("dynrec_exec: continue loop, total_executed=%d", total_executed);
+        continue;
+    }
+
+    total_executed += block->x86_len;
     }
 
     return total_executed > 0 ? total_executed : max_instr;
@@ -1113,7 +1102,7 @@ uint64_t dynrec_get_interpreter_instr_count(void) {
 
 #else  /* !__ARM_ARCH_5TE__ */
 
-int dynrec_enabled = 0;
+volatile int dynrec_enabled = 0;
 
 void dynrec_init(void) {}
 void dynrec_reset(void) {}
