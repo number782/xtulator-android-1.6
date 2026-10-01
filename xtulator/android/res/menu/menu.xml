@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@+id/menu_dynrec" android:title="Dynamic Recompiler" android:checkable="true" android:checked="false" />
+    <item android:id="@+id/menu_reset" android:title="Reset" android:icon="@android:drawable/ic_menu_rotate" />
+    <item android:id="@+id/menu_changedisk" android:title="Change Floppy" android:icon="@android:drawable/ic_menu_save" />
+    <item android:id="@+id/menu_showspeed" android:title="Show CPU Speed" android:checkable="true" android:checked="false" />
+    <group android:checkableBehavior="none">
+        <item android:id="@+id/menu_trace_cpu" android:title="Trace CPU" android:checkable="true" android:checked="false" />
+        <item android:id="@+id/menu_trace_keyboard" android:title="Trace Keyboard" android:checkable="true" android:checked="false" />
+        <item android:id="@+id/menu_trace_interrupts" android:title="Trace Interrupts" android:checkable="true" android:checked="false" />
+        <item android:id="@+id/menu_trace_disk" android:title="Trace Disk" android:checkable="true" android:checked="false" />
+        <item android:id="@+id/menu_trace_misc" android:title="Trace Other" android:checkable="true" android:checked="false" />
+    </group>
+</menu>

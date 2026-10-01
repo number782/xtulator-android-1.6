@@ -1,0 +1,3 @@
+set solib-search-path /src/android/obj/local/armeabi
+source /opt/android/android-ndk-r10e/prebuilt/common/gdb/common.setup
+directory /opt/android/android-ndk-r10e/platforms/android-4/arch-arm/usr/include /opt/android/android-ndk-r10e/sources/cxx-stl/system /src/android/jni/../../XTulator

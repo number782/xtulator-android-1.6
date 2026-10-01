@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="XTulator" default="help">
+    <property file="local.properties" />
+    <property file="build.properties" />
+    <property file="project.properties" />
+    <property file="ant.properties" />
+    <import file="${sdk.dir}/tools/ant/build.xml" />
+</project>

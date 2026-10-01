@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    XTulator Android Manifest
+    Target: Android 2.3 (API Level 9) - minimum for AAssetManager API
+    Package: com.xtulator.android
+-->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.xtulator.android"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- Minimum and Target SDK: Android 5.0 Lollipop (API 21) -->
+    <uses-sdk
+        android:minSdkVersion="4"
+        android:targetSdkVersion="19" />
+
+    <!-- Permissions for emulator functionality -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Hardware features (optional for emulator) -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.keyboard" android:required="false" />
+
+    <application
+        android:icon="@drawable/icon"
+        android:label="@string/app_name"
+        android:debuggable="true">
+
+        <!-- Main Activity: XTulatorActivity -->
+        <activity
+            android:name=".XTulatorActivity"
+            android:label="@string/app_name"
+            android:configChanges="orientation|keyboardHidden"
+            android:screenOrientation="landscape">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>
