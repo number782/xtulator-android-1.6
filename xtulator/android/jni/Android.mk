@@ -38,6 +38,8 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/../../XTulator
 
 LOCAL_CFLAGS := -D__ANDROID__ -D__ARM_ARCH_5TE__ -O2 -g -std=gnu99
 
+LOCAL_ARM_MODE := arm
+
 LOCAL_LDLIBS := -llog -lm
 
 include $(BUILD_SHARED_LIBRARY)

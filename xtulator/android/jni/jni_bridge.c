@@ -2,13 +2,22 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 #include <android/log.h>
 
 #include "android_frontend.h"
+
+/* Dynrec crash attribution. Declared here rather than via dynrec.h so this
+ * file does not have to pull in the CPU / chipset headers. */
+int dynrec_get_code_cache(uintptr_t *base, uint32_t *size);
+int dynrec_get_current_block(uint32_t *arm_off, uint32_t *code_len, uint32_t *x86_pc);
+int dynrec_get_current_entry(uint32_t *entry_cpu, uint32_t *caller_r4);
 
 #include "../XTulator/config.h"
 #include "../XTulator/ports.h"
@@ -66,6 +75,337 @@ static volatile uint8_t goCPU = 1, limitCPU = 0, emu_paused = 0;
 static uint8_t keybuf[KEYBUF_SIZE];
 static volatile uint32_t keybuf_head = 0, keybuf_tail = 0;
 static char title[64];
+
+/* Map a fault PC through /proc/self/maps and log the containing mapping.
+ *
+ * Deliberately not dladdr(): the NDK r5c headers predate Dl_info (so it
+ * does not even compile), and linking libdl purely for a crash path is not
+ * worth the extra dependency. The mapping line carries the module path and
+ * segment offset, which is enough to resolve the symbol against the .so
+ * afterwards.
+ */
+static void dump_maps_line_for_pc(int fd, unsigned pc) {
+    FILE *mf;
+    char line[512];
+    char out[640];
+    int mfd;
+
+    mfd = open("/proc/self/maps", O_RDONLY);
+    if (mfd < 0) {
+        int n = snprintf(out, sizeof(out), "  (cannot open /proc/self/maps)\n");
+        write(fd, out, n);
+        return;
+    }
+    /* fgets() needs a FILE*, not a raw descriptor. */
+    mf = fdopen(mfd, "r");
+    if (mf == NULL) {
+        close(mfd);
+        return;
+    }
+    while (fgets(line, sizeof(line), mf)) {
+        unsigned long lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && pc >= lo && pc < hi) {
+            int n;
+            line[strcspn(line, "\n")] = '\0';
+            n = snprintf(out, sizeof(out),
+                         "  maps: %s   (offset in mapping = 0x%lx)\n",
+                         line, (unsigned long)(pc - lo));
+            write(fd, out, n);
+            break;
+        }
+    }
+    fclose(mf);
+}
+
+static void crash_signal_handler(int sig, siginfo_t *info, void *ctx) {
+    int fd = open("/sdcard/xtulator_crash_detail.log",
+                  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char buf[1024];
+        int len;
+
+        len = snprintf(buf, sizeof(buf),
+            "CRASH: signal=%d errno=%d code=%d fault_addr=%p\n",
+            sig, info ? info->si_errno : 0, info ? info->si_code : 0,
+            info ? info->si_addr : (void *)0);
+        write(fd, buf, len);
+
+        if (ctx) {
+            ucontext_t *uc = (ucontext_t *)ctx;
+            len = snprintf(buf, sizeof(buf),
+                "ARM REGISTERS:\n"
+                "  R0=%08x  R1=%08x  R2=%08x  R3=%08x\n"
+                "  R4=%08x  R5=%08x  R6=%08x  R7=%08x\n"
+                "  R8=%08x  R9=%08x  R10=%08x R11=%08x\n"
+                "  R12=%08x SP=%08x LR=%08x PC=%08x\n"
+                "  CPSR=%08x\n",
+                (unsigned)uc->uc_mcontext.arm_r0,
+                (unsigned)uc->uc_mcontext.arm_r1,
+                (unsigned)uc->uc_mcontext.arm_r2,
+                (unsigned)uc->uc_mcontext.arm_r3,
+                (unsigned)uc->uc_mcontext.arm_r4,
+                (unsigned)uc->uc_mcontext.arm_r5,
+                (unsigned)uc->uc_mcontext.arm_r6,
+                (unsigned)uc->uc_mcontext.arm_r7,
+                (unsigned)uc->uc_mcontext.arm_r8,
+                (unsigned)uc->uc_mcontext.arm_r9,
+                (unsigned)uc->uc_mcontext.arm_r10,
+                (unsigned)uc->uc_mcontext.arm_fp,
+                (unsigned)uc->uc_mcontext.arm_ip,
+                (unsigned)uc->uc_mcontext.arm_sp,
+                (unsigned)uc->uc_mcontext.arm_lr,
+                (unsigned)uc->uc_mcontext.arm_pc,
+                (unsigned)uc->uc_mcontext.arm_cpsr);
+            write(fd, buf, len);
+
+            /* Dynrec attribution. The generated blocks live in anonymous
+             * mmap'd memory, so without this a fault inside one shows up
+             * as a bare PC with no symbol and no way to tell it apart from
+             * a fault inside a helper. Dump the block that was executing
+             * and the ARM words around the faulting PC. */
+            {
+                uintptr_t cc_base = 0;
+                uint32_t cc_size = 0;
+                uint32_t arm_off = 0, code_len = 0, x86_pc = 0;
+                unsigned pc = (unsigned)uc->uc_mcontext.arm_pc;
+
+                dynrec_get_code_cache(&cc_base, &cc_size);
+                dynrec_get_current_block(&arm_off, &code_len, &x86_pc);
+
+                len = snprintf(buf, sizeof(buf),
+                    "DYNREC: cache=[%p..%p) active x86_pc=0x%05X arm_off=%u code_len=%u\n",
+                    (void*)cc_base, (void*)(cc_base + cc_size),
+                    x86_pc, arm_off, code_len);
+                write(fd, buf, len);
+
+                /* entry_cpu is the cpu pointer dynrec_exec passed to
+                 * func(cpu), sampled from C and therefore trustworthy. The
+                 * cpu pointer is the ARGUMENT carried in R0 at each helper
+                 * call site (the prologue `mov r4, r0` copies it into the
+                 * block's R4, but R4 is a callee-saved register that every
+                 * C helper — including cpu_exec itself — is free to reuse for
+                 * its own locals, so fault-time R4 is NOT the block's R4 and
+                 * is usually just the guest x86_pc). Check fault-time R0
+                 * (== entry_cpu) to decide whether the cpu pointer survived
+                 * the trip into the helper. caller_r4 is the C caller's R4 and
+                 * is printed only for reference. */
+                {
+                    uint32_t entry_cpu = 0, caller_r4 = 0;
+                    uint32_t fault_r0 = (uint32_t)uc->uc_mcontext.arm_r0;
+                    uint32_t fault_r4 = (uint32_t)uc->uc_mcontext.arm_r4;
+                    const char *verdict;
+
+                    dynrec_get_current_entry(&entry_cpu, &caller_r4);
+
+                    if (entry_cpu == 0) {
+                        verdict = "no dynrec block was active";
+                    } else if (entry_cpu < 0x00100000u || entry_cpu > 0xF0000000u) {
+                        /* A .bss global such as &machine.CPU is in a mapped
+                         * .so image, i.e. well above 1MB on 32-bit Android;
+                         * anything under 1MB is an x86_pc or truncated value,
+                         * not a CPU_t. */
+                        verdict = "block was entered with a bogus cpu pointer "
+                                  "(caller side)";
+                    } else if (fault_r0 == entry_cpu) {
+                        verdict = "cpu pointer intact (fault-time R0 == "
+                                  "entry_cpu)";
+                    } else {
+                        verdict = "cpu pointer corrupted between block entry "
+                                  "and fault (R0 != entry_cpu)";
+                    }
+
+                    len = snprintf(buf, sizeof(buf),
+                        "  entry_cpu=0x%08X fault_r0=0x%08X fault_r4=0x%08X "
+                        "caller_r4=0x%08X (C caller's R4, not the block's) -> %s\n",
+                        entry_cpu, fault_r0, fault_r4, caller_r4, verdict);
+                    write(fd, buf, len);
+                }
+
+                /* LR/SP classification. arm_lr separates a fault that
+                 * happened inside a helper called from a generated block
+                 * (LR points back into the code cache) from a fault that
+                 * is not in generated code at all (LR follows the ordinary
+                 * C call chain inside libxtulator.so). arm_sp alignment is
+                 * an AAPCS invariant; combined with a live block + an
+                 * in-cache LR, a misaligned SP directly implicates a helper
+                 * that disturbed SP so the block's pop {r4,r10,r11,pc}
+                 * reloaded a garbage R4 from the wrong stack slot. */
+                {
+                    unsigned arm_sp = (unsigned)uc->uc_mcontext.arm_sp;
+                    unsigned arm_lr = (unsigned)uc->uc_mcontext.arm_lr;
+                    const char *lr_where;
+                    int in_cache = (cc_base && cc_size &&
+                                    arm_lr >= (unsigned)cc_base &&
+                                    arm_lr < (unsigned)(cc_base + cc_size));
+                    int in_so = 0;
+                    int maps_fd = open("/proc/self/maps", O_RDONLY);
+                    if (maps_fd >= 0) {
+                        FILE *mf_maps = fdopen(maps_fd, "r");
+                        if (mf_maps) {
+                            char mline[512];
+                            while (fgets(mline, sizeof(mline), mf_maps)) {
+                                unsigned long lo_m = 0, hi_m = 0;
+                                if (sscanf(mline, "%lx-%lx", &lo_m, &hi_m) == 2 &&
+                                    arm_lr >= (unsigned)lo_m &&
+                                    arm_lr < (unsigned)hi_m) {
+                                    if (strstr(mline, "libxtulator.so")) {
+                                        in_so = 1;
+                                    }
+                                    break;
+                                }
+                            }
+                            fclose(mf_maps);
+                        } else {
+                            close(maps_fd);
+                        }
+                    }
+                    if (in_cache) {
+                        lr_where = "inside code cache";
+                    } else if (in_so) {
+                        lr_where = "inside libxtulator.so";
+                    } else {
+                        lr_where = "neither (not in cache, not in libxtulator.so)";
+                    }
+                    {
+                        int sp_aligned = (arm_sp & 7u) == 0;
+                        int block_active = (arm_off != 0xFFFFFFFFu && code_len > 0);
+                        int sp_implicated = (in_cache && block_active && !sp_aligned);
+                        len = snprintf(buf, sizeof(buf),
+                            "  LR/SP: arm_lr=0x%08X (%s), arm_sp=0x%08X %s, "
+                            "block_active=%s, sp_unaligned_in_cache=%s\n",
+                            arm_lr, lr_where, arm_sp,
+                            sp_aligned ? "8-byte-aligned" : "NOT 8-byte-aligned",
+                            block_active ? "yes" : "no",
+                            sp_implicated ? "yes (implicates SP imbalance)" : "no");
+                        write(fd, buf, len);
+                    }
+                }
+
+                if (cc_base && cc_size && pc >= cc_base && pc < cc_base + cc_size) {
+                    /* Word-aligned window centred on the fault. */
+                    uint32_t *w = (uint32_t *)(cc_base + ((pc - cc_base) & ~3u));
+                    int i;
+                    len = snprintf(buf, sizeof(buf),
+                        "  fault is in generated code; ARM words around PC:\n");
+                    write(fd, buf, len);
+                    for (i = -4; i <= 4; i++) {
+                        len = snprintf(buf, sizeof(buf), "   %c %p: %08x\n",
+                            (i == 0) ? '>' : ' ', (void *)(w + i), w[i]);
+                        write(fd, buf, len);
+                    }
+                } else if (cc_base && cc_size) {
+                    len = snprintf(buf, sizeof(buf),
+                        "  fault PC is NOT in the code cache; faulted in a library\n");
+                    write(fd, buf, len);
+                    dump_maps_line_for_pc(fd, pc);
+                }
+
+                /* A block can fault inside a helper (fault PC in the .so)
+                 * while still having published arm_off/code_len. Dumping the
+                 * active block is then the only way to see the ARM code that
+                 * called the helper — do it regardless of where PC landed. */
+                if (cc_base && cc_size && arm_off != 0xFFFFFFFFu && code_len > 0) {
+                    enum { DUMP_MAX = 64 };  /* 64 words == 256 bytes */
+                    uint32_t nwords = code_len / 4;
+                    uint32_t truncated = 0;
+                    uint32_t i;
+                    uint32_t *w;
+
+                    if (nwords > DUMP_MAX) {
+                        nwords = DUMP_MAX;
+                        truncated = 1;
+                    }
+                    w = (uint32_t *)(cc_base + arm_off);
+                    len = snprintf(buf, sizeof(buf),
+                        "  active block at %p, %u bytes (dumping %u words as off word):\n",
+                        (void *)(cc_base + arm_off), code_len, nwords);
+                    write(fd, buf, len);
+                    for (i = 0; i < nwords; i++) {
+                        len = snprintf(buf, sizeof(buf), "   %04X %08X\n", i * 4, w[i]);
+                        write(fd, buf, len);
+                    }
+                     if (truncated) {
+                         len = snprintf(buf, sizeof(buf),
+                             "  (block dump TRUNCATED at %u words of %u bytes)\n",
+                             nwords, code_len);
+                         write(fd, buf, len);
+                     }
+                 }
+
+                 /* Guest bytes at the faulting x86_pc. The active block was
+                  * translating/executing the guest instruction that lives here;
+                  * printing its machine code is what pins down which opcode the
+                  * interpreter was emulating when the native control transfer to
+                  * fault_addr happened. */
+                 if (x86_pc) {
+                     uint8_t gb[8];
+                     int gn = dynrec_get_guest_bytes(x86_pc, sizeof(gb), gb);
+                     int gi;
+                     len = snprintf(buf, sizeof(buf),
+                         "  guest bytes at x86_pc=0x%05X:", x86_pc);
+                     write(fd, buf, len);
+                     for (gi = 0; gi < gn; gi++) {
+                         len = snprintf(buf, sizeof(buf), " %02X", gb[gi]);
+                         write(fd, buf, len);
+                     }
+                     if (gn == 0) {
+                         len = snprintf(buf, sizeof(buf),
+                             " (unmapped/MIO at 0x%05X)", x86_pc);
+                     } else {
+                         len = snprintf(buf, sizeof(buf), " (OK)");
+                     }
+                     write(fd, buf, len);
+                  }
+             }
+
+             /* Native backtrace: no DWARF in this build, so scan the stack
+              * for values that look like return addresses (this module's
+              * text, the JIT code cache, or bionic/libc) to reconstruct the
+              * call chain that reached the faulting native PC. */
+             {
+                 uintptr_t bt_base = 0; uint32_t bt_size = 0;
+                 dynrec_get_code_cache(&bt_base, &bt_size);
+                 unsigned bsp = (unsigned)uc->uc_mcontext.arm_sp;
+                 unsigned bpc = (unsigned)uc->uc_mcontext.arm_pc;
+                 unsigned i;
+                 len = snprintf(buf, sizeof(buf),
+                     "NATIVE_BT: pc=0x%08X sp=0x%08X lr=0x%08X\n",
+                     bpc, bsp, (unsigned)uc->uc_mcontext.arm_lr);
+                 write(fd, buf, len);
+                 for (i = 0; i < 48; i++) {
+                     unsigned word = *((volatile unsigned*)(bsp + (i * 4)));
+                     if ((word >= 0x41f00000u && word <= 0x42100000u) ||
+                         (bt_base && word >= (unsigned)bt_base &&
+                          word < (unsigned)(bt_base + bt_size)) ||
+                         (word >= 0xb0000000u && word <= 0xc0000000u)) {
+                         len = snprintf(buf, sizeof(buf),
+                             "  [%2u] 0x%08X\n", i, word);
+                         write(fd, buf, len);
+                     }
+                 }
+             }
+         }
+
+         close(fd);
+     }
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void install_crash_handlers(void) {
+    struct sigaction sa;
+    sa.sa_sigaction = crash_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_ONESHOT;
+
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+}
 
 static void optimer(void* dummy) {
 	/*
@@ -141,6 +481,8 @@ JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeInit(JNI
 	sprintf(title, "%s v%s", STR_TITLE, STR_VERSION);
 	LOGI("nativeInit: title=%s", title);
 	DIAG("nativeInit: starting");
+
+	install_crash_handlers();
 
 	if (biosPath != NULL) {
 		biosPathStr = (*env)->GetStringUTFChars(env, biosPath, NULL);

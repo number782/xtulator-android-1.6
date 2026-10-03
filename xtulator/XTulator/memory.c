@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "config.h"
 #include "cpu/cpu.h"
 #include "cpu/dynrec.h"
@@ -45,7 +47,28 @@ void cpu_write(CPU_t* cpu, uint32_t addr32, uint8_t value) {
 		dynrec_invalidate_range(addr32, 1);
 	}
 	else if (memory_mapWriteCallback[addr32] != NULL) {
-		(*memory_mapWriteCallback[addr32])(memory_udata[addr32], addr32, value);
+		void (*cb)(void*, uint32_t, uint8_t) = memory_mapWriteCallback[addr32];
+		uint32_t cbaddr = (uint32_t)(uintptr_t)cb;
+		/* Guard stale write-callback pointers, mirroring cpu_read(). A
+		 * callback outside the libxtulator.so text region is a stale/corrupt
+		 * slot and would BLX into unmapped memory (the 0x224 fault). Log it
+		 * and drop the write so emulation can proceed to reveal the real
+		 * fault. libxtulator.so is relocated at ~0x42000000; valid callbacks
+		 * (cga_writememory, vga_writememory, ...) live in its text range. */
+		if (cbaddr < 0x40000000u || cbaddr > 0x50000000u) {
+			int fd = open("/sdcard/xt_memcb_dump.log",
+			              O_WRONLY | O_CREAT | O_APPEND, 0644);
+			if (fd >= 0) {
+				char b[224];
+				int n = snprintf(b, sizeof(b),
+					"BADWRITECALLBACK wr addr=0x%05X cb=0x%08X udata=%p\n",
+					(unsigned)addr32, cbaddr, memory_udata[addr32]);
+				write(fd, b, n);
+				close(fd);
+			}
+			return;
+		}
+		(*cb)(memory_udata[addr32], addr32, value);
 	}
 }
 
@@ -56,9 +79,31 @@ uint8_t cpu_read(CPU_t* cpu, uint32_t addr32) {
 		return *(memory_mapRead[addr32]);
 	}
 
-	if (memory_mapReadCallback[addr32] != NULL) {
-		return (*memory_mapReadCallback[addr32])(memory_udata[addr32], addr32);
-	}
+    if (memory_mapReadCallback[addr32] != NULL) {
+        uint8_t (*cb)(void*, uint32_t) = memory_mapReadCallback[addr32];
+        uint32_t cbaddr = (uint32_t)(uintptr_t)cb;
+        /* A read-data callback that points outside this module's text is the
+         * signature of the crash-on-first-BIOS-instruction fault: cpu_read
+         * would BLX to cbaddr and fetch at an unmapped address. libxtulator.so
+         * is relocated at ~0x42000000; anything far outside its text is almost
+         * always a stale/MCorrupt callback slot. Log it and return open-bus
+         * (0xFF) instead of calling through, so execution can proceed far
+         * enough to reveal the real fault. */
+        if (cbaddr < 0x40000000u || cbaddr > 0x50000000u) {
+            int fd = open("/sdcard/xt_memcb_dump.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                char b[192];
+                int n = snprintf(b, sizeof(b),
+                    "BADCALLBACK rd addr=0x%05X cb=0x%08X udata=%p\n",
+                    (unsigned)addr32, cbaddr, memory_udata[addr32]);
+                write(fd, b, n);
+                close(fd);
+            }
+            return 0xFF;
+        }
+        return (*cb)(memory_udata[addr32], addr32);
+    }
 
 	return 0xFF;
 }

@@ -70,6 +70,11 @@ public class XTulatorActivity extends Activity {
     private static final int TRACE_DISK     = 0x04;
     private static final int TRACE_MISC     = 0x40;
     private static final int TRACE_VIDEO    = 0x20;
+    /** TRACE_FLAG_DIAG — /sdcard/xtulator_dynrec.log, written by dynrec.c crashlog().
+     *  Off by default: every dynrec crashlog() call is an fopen/fflush/fclose
+     *  against FUSE-backed /sdcard, and the hot path emits ~6 per executed
+     *  block. Turn this on only when the dynrec log is what you need. */
+    private static final int TRACE_DIAG    = 0x80;
     /** JNI call to toggle a single trace category bit in the native core. */
     public native void nativeSetTraceFlag(int flag, boolean enabled);
     public native void nativeEnableDynrec(boolean enable);
@@ -82,6 +87,7 @@ public class XTulatorActivity extends Activity {
     private boolean mTraceInterrupts = false;
     private boolean mTraceDisk = false;
     private boolean mTraceMisc = false;
+    private boolean mTraceDiag = false;
     private boolean         mDynrecEnabled = false;
     private AudioTrack mAudioTrack = null;
     private Thread mAudioFlushThread = null;
@@ -235,6 +241,14 @@ public class XTulatorActivity extends Activity {
             nativeSetTraceFlag(TRACE_MISC, mTraceMisc);
             saveTraceSettings();
             return true;
+        } else if (item.getItemId() == R.id.menu_trace_diag) {
+            mTraceDiag = !mTraceDiag;
+            item.setChecked(mTraceDiag);
+            nativeSetTraceFlag(TRACE_DIAG, mTraceDiag);
+            saveTraceSettings();
+            Log.i("XTulator", "Dynrec /sdcard log " + (mTraceDiag ? "ENABLED" : "disabled")
+                  + " -> /sdcard/xtulator_dynrec.log");
+            return true;
         }
         return super.onMenuItemSelected(featureId, item);
     }
@@ -246,14 +260,16 @@ public class XTulatorActivity extends Activity {
         mTraceKeyboard = prefs.getBoolean("trace_keyboard", false);
         mTraceInterrupts = prefs.getBoolean("trace_interrupts", false);
         mTraceDisk = prefs.getBoolean("trace_disk", false);
-        mTraceMisc = true; /* Enable by default for debugging */
+        mTraceMisc = true;
         nativeSetTraceFlag(TRACE_MISC, true);
-        nativeSetTraceFlag(0x80, false); /* TRACE_FLAG_DIAG — disabled for performance */
-        nativeSetTraceFlag(TRACE_VIDEO, false); /* Disable video trace to avoid logflood */
-        mDynrecEnabled = prefs.getBoolean("dynrec", false);
-        nativeEnableDynrec(mDynrecEnabled); /* Dynrec disabled by default — enable via menu */
+        mTraceDiag = false;
+        nativeSetTraceFlag(TRACE_DIAG, true);
+        nativeSetTraceFlag(TRACE_VIDEO, false);
+        mDynrecEnabled = true;
+        nativeEnableDynrec(true);
         Log.i("XTulator", "Restored trace settings: cpu=" + mTraceCpu + " keyboard=" + mTraceKeyboard
               + " interrupts=" + mTraceInterrupts + " disk=" + mTraceDisk + " misc=" + mTraceMisc
+              + " diag=" + mTraceDiag
               + " showSpeed=" + mShowSpeed);
     }
 
@@ -266,6 +282,7 @@ public class XTulatorActivity extends Activity {
         editor.putBoolean("trace_interrupts", mTraceInterrupts);
         editor.putBoolean("trace_disk", mTraceDisk);
         editor.putBoolean("trace_misc", mTraceMisc);
+        editor.putBoolean("trace_diag", mTraceDiag);
         editor.putBoolean("dynrec", mDynrecEnabled);
         editor.commit();
     }
@@ -539,10 +556,11 @@ public class XTulatorActivity extends Activity {
         private final XTulatorActivity mActivity;
         private volatile boolean mRunning = false;
         private Thread mRenderThread;
-        private Bitmap mBitmap;
-        private int[] mPixels;
-        private int mFbW = 0;
-        private int mFbH = 0;
+         private Bitmap mBitmap;
+         private final Object mBitmapLock = new Object();
+         private int[] mPixels;
+         private int mFbW = 0;
+         private int mFbH = 0;
         private Paint mSpeedPaint = null;
 
         public XTulatorView(XTulatorActivity activity) {
@@ -583,6 +601,9 @@ public class XTulatorActivity extends Activity {
                 }
                 mRenderThread = null;
             }
+            synchronized (mBitmapLock) {
+                mBitmap = null;
+            }
         }
 
         private void renderLoop() {
@@ -598,25 +619,26 @@ public class XTulatorActivity extends Activity {
                 if ((w != mFbW || h != mFbH) && w > 0 && h > 0
                         && (w * (long) h) <= (long) FB_MAX_PIXELS
                         && h >= 200) {
-                    if (mBitmap != null) {
-                        mBitmap.recycle();
+                    synchronized (mBitmapLock) {
+                        mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                        mFbW = w;
+                        mFbH = h;
                     }
-                    mBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                    mFbW = w;
-                    mFbH = h;
                     Log.i("XTulator", "RenderLoop: new bitmap " + w + "x" + h);
                 }
-                if (mBitmap != null && mPixels != null && mFbW > 0 && mFbH > 0) {
-                    if (copied > 0 && frameCount % 300 == 0) {
-                        int firstPix = mPixels[0];
-                        int midPix = mPixels[(mFbW * mFbH) / 2];
-                        Log.i("XTulator", "RenderLoop: copied " + copied + " pixels, frame " + frameCount
-                                + " first=0x" + Integer.toHexString(firstPix)
-                                + " mid=0x" + Integer.toHexString(midPix)
-                                + " fbW=" + mFbW + " fbH=" + mFbH);
+                synchronized (mBitmapLock) {
+                    if (mBitmap != null && mPixels != null && mFbW > 0 && mFbH > 0) {
+                        if (copied > 0 && frameCount % 300 == 0) {
+                            int firstPix = mPixels[0];
+                            int midPix = mPixels[(mFbW * mFbH) / 2];
+                            Log.i("XTulator", "RenderLoop: copied " + copied + " pixels, frame " + frameCount
+                                    + " first=0x" + Integer.toHexString(firstPix)
+                                    + " mid=0x" + Integer.toHexString(midPix)
+                                    + " fbW=" + mFbW + " fbH=" + mFbH);
+                        }
+                        mBitmap.setPixels(mPixels, 0, mFbW, 0, 0, mFbW, mFbH);
+                        postInvalidate();
                     }
-                    mBitmap.setPixels(mPixels, 0, mFbW, 0, 0, mFbW, mFbH);
-                    postInvalidate();
                 }
                 frameCount++;
                 try {
@@ -631,9 +653,13 @@ public class XTulatorActivity extends Activity {
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            Bitmap bitmap = mBitmap;
-            int fbW = mFbW;
-            int fbH = mFbH;
+            Bitmap bitmap;
+            int fbW, fbH;
+            synchronized (mBitmapLock) {
+                bitmap = mBitmap;
+                fbW = mFbW;
+                fbH = mFbH;
+            }
             if (bitmap != null && fbW > 0 && fbH > 0) {
                 int vw = getWidth();
                 int vh = getHeight();
@@ -652,10 +678,12 @@ public class XTulatorActivity extends Activity {
                     }
                     String speedStr = mActivity.nativeGetSpeedPct() + "%";
                     if (mActivity.isDynrecEnabled()) {
-                        speedStr += " DR:N" + mActivity.nativeGetDynrecNativeBlocks() + " I:" + mActivity.nativeGetDynrecInterpreterInstrs();
+                        speedStr += " DR:N" + mActivity.nativeGetDynrecNativeBlocks();
+                        speedStr += " I:" + mActivity.nativeGetDynrecInterpreterInstrs();
                     }
                     float speedW = mSpeedPaint.measureText(speedStr);
-                    canvas.drawText(speedStr, vw - speedW - 5, 20, mSpeedPaint);
+                    float speedH = mSpeedPaint.getFontSpacing();
+                    canvas.drawText(speedStr, vw - speedW - 5, vh - speedH - 5, mSpeedPaint);
                 }
             }
         }

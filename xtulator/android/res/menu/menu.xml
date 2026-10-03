@@ -10,5 +10,6 @@
         <item android:id="@+id/menu_trace_interrupts" android:title="Trace Interrupts" android:checkable="true" android:checked="false" />
         <item android:id="@+id/menu_trace_disk" android:title="Trace Disk" android:checkable="true" android:checked="false" />
         <item android:id="@+id/menu_trace_misc" android:title="Trace Other" android:checkable="true" android:checked="false" />
+        <item android:id="@+id/menu_trace_diag" android:title="Trace Dynrec Log" android:checkable="true" android:checked="false" />
     </group>
 </menu>

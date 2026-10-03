@@ -40,12 +40,72 @@
 #define DBGLOG(...)
 #endif
 
+#ifdef __ANDROID__
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+static void crashlog(const char* fmt, ...) {
+    FILE* f;
+    va_list args;
+
+    /*
+	Gated on TRACE_FLAG_DIAG like every other /sdcard diagnostic. This was
+	previously unconditional while DLOGI() respected the flags, which meant
+	seven of the eighteen call sites fired an fopen/write/fflush/fclose
+	cycle against the FUSE-backed /sdcard on the hot path — six of them
+	per executed block. On the single-core 528MHz IS01 that alone starved
+	the 8088 core and the PIT/PIC timers behind it. Turn the flag back on
+	from the on-device trace menu when the dynrec log is actually needed.
+    */
+    if (!(trace_flags & TRACE_FLAG_DIAG)) return;
+
+    f = fopen("/sdcard/xtulator_dynrec.log", "a");
+    if (f) {
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        va_end(args);
+        fputc('\n', f);
+        fclose(f);
+    }
+}
+#else
+static void crashlog(const char* fmt, ...) {}
+#endif
+
+
+
 #ifdef __ARM_ARCH_5TE__
+
+/* On ARMv5TE Linux/Android, cacheflush is a syscall, not a libc function.
+ * The Android NDK declares it in <unistd.h> as:
+ *   extern int cacheflush(long start, long end, long flags);
+ * We call it via syscall() to ensure proper ARM SWI convention.
+ * However, the NDK declaration is sufficient — we just need to ensure
+ * we don't conflict with it. The existing call site uses 0x3 for flags.
+ *
+ * Note: On older NDK versions this declaration may be missing, but r10e
+ * includes it. If building with an older NDK, define our own. */
+#ifdef __ANDROID__
+/* If cacheflush is not declared by the system headers */
+#ifndef _DECL_CACHEFLUSH
+#define _DECL_CACHEFLUSH
+/* The system already declares cacheflush in <unistd.h> */
+#endif
+#endif
 
 /* Reduced from 512KB to 256KB to fit within IS01's memory constraints */
 #define CODE_CACHE_SIZE    (256 * 1024)
 #define MAX_BLOCKS         1024
 #define MAX_INSTRUCTIONS   128
+
+/*
+	Flush the whole JIT when the code cache gets within this many bytes of
+	full. Dead blocks are not compacted out of the code cache, so without a
+	flush point the cache would eventually fill with unreachable code and
+	emit32() would fail forever. Flushing everything is the simple correct
+	answer: the worst case is that the blocks in flight get retranslated.
+*/
+#define CODE_CACHE_FLUSH_MARGIN (16 * 1024)
 
 volatile int dynrec_enabled = 0;
 
@@ -57,13 +117,34 @@ static uint32_t code_cache_pos = 0;
 typedef struct {
     uint32_t x86_pc;      /* CS*16 + IP */
     uint32_t arm_offset;  /* offset in code cache */
-    uint32_t code_len;
+    uint32_t code_len;    /* bytes of generated ARM code */
+    /*
+     * x86_len and instr_count are two DIFFERENT quantities and conflating
+     * them was a real bug:
+     *
+     *   x86_len      BYTES of guest x86 code this block covers. This is the
+     *                block's invalidation footprint (a write anywhere in
+     *                [x86_pc, x86_pc + x86_len) makes the block stale) and
+     *                the input to expected_end_ip. It must be the TRUE
+     *                encoding length of every instruction in the block --
+     *                see x86_instr_len() for why that is not just "1" for
+     *                the interpreter-deferred opcodes.
+     *
+     *   instr_count  NUMBER of x86 instructions in the block. This is what
+     *                dynrec_exec() accumulates into its "instructions
+     *                executed" budget. Charging x86_len here made a block of
+     *                five 1-byte MOVs count as 5 but a block of one 4-byte
+     *                JZ count as 4, and a block containing a 6-byte
+     *                ModR/M instruction count as 6.
+     */
     uint32_t x86_len;
+    uint32_t instr_count;
     uint32_t x86_end_ip;  /* expected IP after block (if no control flow) */
+    uint8_t  valid;       /* 0 = free slot. Not x86_pc==0, which is a real address. */
 } block_entry_t;
 
 static block_entry_t block_cache[MAX_BLOCKS];
-static int block_cache_count = 0;
+static int block_cache_count = 0;  /* high-water mark: slots [0, count) are allocated */
 
 /* ---- Dynrec statistics (for diagnostics) ---- */
 volatile uint32_t dynrec_native_blocks = 0;    /* count of ARM blocks executed natively */
@@ -163,34 +244,111 @@ static void emit_ldr_imm32(int Rd, uint32_t imm) {
     } else if (b2 == 0 && b3 == 0) {
         emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | b0);   /* MOV Rd, #b0 */
         if (b1 != 0) {
-            emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | (12 << 7) | b1);  /* ORR Rd, Rd, #b1, LSL #8 */
+            emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | (12 << 8) | b1);  /* ORR Rd, Rd, #b1, LSL #8 */
         }
     }
     /* For 3-4 byte immediates, would need additional ORR instructions with rotates */
 }
 
-/* BL to target — computes offset automatically at emit time */
+/* BL to target — computes offset automatically at emit time.
+ *
+ * ======================================================================
+ * THE INVARIANT BOTH PATHS SHARE — read this before changing either one
+ * ======================================================================
+ * ARM's `BL` (immediate) and `BLX <Rm>` set LR = PC = (address of the call
+ * word) + 8, i.e. the word TWO positions on — NOT the word immediately
+ * after it. The two forms do not differ in that respect, so emit_bl() must
+ * produce the same shape for BOTH of them:
+ *
+ *     ... build R12 ...            (indirect path only)
+ *     X+0:  BL  target  /  BLX R12 ; LR = X+8
+ *     X+4:  B .-4  (0xEAFFFFFF)   ; spacing word, see below
+ *     X+8:  <caller's next word>   ; <- LR points HERE
+ *
+ * The `B .-4` spacing word is required, not decoration. emit_bl() cannot
+ * know whether more code follows: for the last helper call in a block the
+ * next word the caller emits is the POP epilogue, and a call word with
+ * LR = call+8 would return one word PAST it — skipping the epilogue,
+ * leaving R4 and SP unrestored, and then executing whatever bytes follow
+ * in the code cache as ARM instructions. Mid-block it is just as bad, in
+ * the other direction: the word the caller emitted at call+4 is skipped.
+ * The spacing word absorbs the +8 bias, so LR always lands on the caller's
+ * next word whether that is more translated code or the epilogue. It is
+ * never executed (the return address is one word past it) and branches to
+ * the following word if it ever were.
+ *
+ * The two paths below therefore differ ONLY in HOW the target is reached
+ * (a 24-bit direct offset vs. a full 32-bit address in R12), never in what
+ * follows the call word. Keep them structurally parallel.
+ */
 static void emit_bl(uint32_t target_addr) {
     uint32_t pc = code_cache_pos;
-    /* On ARM, PC reads as instruction_address + 8 during execution */
+    /* On ARM, PC reads as instruction_address + 8 during execution. This is
+     * the address of the BL word itself, so it does not move when the
+     * spacing word is added below — the offset must NOT be shifted for it. */
     uint32_t base_pc_plus_8 = (uint32_t)code_cache_base + pc + 8;
     int32_t offset = (int32_t)(target_addr - base_pc_plus_8) / 4;
 
     if (offset > 8388607 || offset < -8388608) {
-        /* Target is out of BL's ±32MB range (24-bit signed offset).
-         * Use indirect call via literal pool:
-         *   A:   LDR R12, [PC, #4]   → PC=A+8, loads from A+12 (target_addr)
-         *   A+4: BLX R12             → LR=A+8, calls target
-         *   A+8: B 0                 → NOP (skip literal pool)
-         *   A+12: .word target_addr  → literal pool (never executed)
-         * After BLX returns to A+8, B 0 is a NOP → continues at caller's next instr. */
-        emit32(0xE59FC004);     /* LDR R12, [PC, #4] */
-        emit32(0xE12FFF9C);     /* BLX R12 */
-        emit32(0xEA000000);     /* B 0 (NOP) — skips over literal pool */
-        emit32(target_addr);    /* literal pool entry */
-        DLOGI("emit_bl: indirect call for target=0x%08X", target_addr);
+        /* Target is out of BL's ±32MB range (24-bit signed offset). This is the
+         * normal case on the IS01: the code cache is mmap'd around 0x2d5b3000
+         * while the helpers live in libxtulator.so around 0x42000000, ~355MB
+         * apart, so *every* helper call lands here.
+         *
+         * Emit an indirect call that materialises the FULL 32-bit target into
+         * R12 and uses BLX Rm. There is deliberately NO literal pool.
+         *
+         * The `B .-4` after the BLX is the shared invariant documented at the
+         * top of this function, not a quirk of this path — the in-range path
+         * emits an identical absorber, because `BL` has exactly the same +8
+         * bias as `BLX <Rm>`.
+         *
+         * Do NOT "optimise" this into `LDR R12,[PC,#n]` + `.word target`:
+         * that is what this code used to do, and BLX's +8 bias put the pool
+         * word exactly at LR, so the helper's own address was executed as ARM
+         * code on every return from every helper call.
+         *
+         * The target is built low-half-first (emit_movw handles the lo==0 /
+         * hi==0 special cases with a single instruction), then bits 16-31 are
+         * ORR'd in -- helper addresses such as 0x4203330c do not fit in 16
+         * bits, so a bare (uint16_t) truncation would silently call the wrong
+         * address on the device.
+         */
+        uint32_t b16 = (target_addr >> 16) & 0xFF;   /* lands in bits 16-23 */
+        uint32_t b24 = (target_addr >> 24) & 0xFF;   /* lands in bits 24-31 */
+
+        emit_movw(12, (uint16_t)(target_addr & 0xFFFF));   /* R12 = target & 0xFFFF */
+        if (b16)
+            /* ORR R12, R12, #b16 — rotate_imm=8 → ROR 16 → value at bits 16-23 */
+            emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16)
+                   | (8 << 8) | b16);
+        if (b24)
+            /* ORR R12, R12, #b24 — rotate_imm=4 → ROR 8 → value at bits 24-31 */
+            emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16)
+                   | (4 << 8) | b24);
+        emit32(0xE12FFF3C);     /* BLX R12 — 0xE12FFF3C; NOT 0xE12FFF9C (that is MSR).
+                                  * Sets LR = (this word + 2), so it is deliberately
+                                  * NOT the last word emitted. */
+        emit32(0xEAFFFFFF);     /* B .-4 — branch to the next word. Absorbs BLX's
+                                  * +8 bias so LR lands on the caller's next word,
+                                  * including the POP when this is the block's last
+                                  * call. Never executed. */
     } else {
-        emit32(0xEB000000 | (offset & 0xFFFFFF));
+        emit32(0xEB000000 | (offset & 0xFFFFFF));  /* BL -- `offset` was computed
+                                                      * from base_pc_plus_8, the
+                                                      * address of THIS word, so it
+                                                      * must not be shifted. */
+        emit32(0xEAFFFFFF);                          /* B .-4 — the SAME absorber
+                                                       * the indirect path emits.
+                                                       * `BL` sets LR = address + 8
+                                                       * exactly like `BLX <Rm>`, so
+                                                       * without this word LR lands
+                                                       * on call+8: one word of the
+                                                       * block is skipped mid-block,
+                                                       * and on the block's last call
+                                                       * the return sails past the
+                                                       * POP epilogue into whatever
+                                                       * follows in the code cache. */
     }
 }
 
@@ -203,9 +361,9 @@ static void emit_b_uncond(uint32_t* patch_slot) {
     *patch_slot = code_cache_pos - 4;
 }
 
-/* SUBS r10, r10, #imm8 */
+/* SUBS r10, r10, #imm8 — base 0xE25AA000 (Rn=Rd=10); 0xE250A000 would be SUBS r10, r0, #imm */
 static void emit_subs_imm(uint8_t imm) {
-    emit32(0xE250A000 | imm);  /* SUBS r10, r10, #imm8 */
+    emit32(0xE25AA000 | imm);
 }
 
 /* BNE target — patch later */
@@ -213,6 +371,19 @@ static uint32_t emit_bne_placeholder(void) {
     emit32(0x1A000000);  /* BNE placeholder (cond=0001=NE) */
     return code_cache_pos - 4;
 }
+
+/* Emit a call to dinstr_advance_ip() to advance cpu->ip by n bytes.
+ *
+ * The interpreter (cpu_exec) advances cpu->ip inside its own dispatch loop,
+ * so the dinstr_* helpers were written assuming IP maintenance is someone
+ * else's job. In generated code there is no dispatch loop, so the
+ * translator has to do it explicitly — otherwise cpu->ip still points at
+ * the first instruction of the block and any helper that reads IP
+ * (dinstr_exec_one, jmp/call/ret/int) operates on the wrong address.
+ *
+ * Defined below the helper declarations since it references dinstr_advance_ip.
+ */
+static void emit_advance_ip(uint32_t n);
 
 /* Patch a branch at pos to target */
 static void patch_branch(uint32_t pos, uint32_t target) {
@@ -234,21 +405,150 @@ static void patch_bl(uint32_t pos, uint32_t target) {
     *((uint32_t*)(code_cache_base + pos)) = orig;
 }
 
+/* ---- Crash attribution ----
+ * The generated blocks are anonymous mmap'd memory, so a fault inside one
+ * shows up in the crash handler as a bare PC with no symbol and no way to
+ * tell it apart from a fault in a helper. Publish the cache bounds and the
+ * block currently executing so the handler can dump the offending ARM
+ * instructions and the x86 PC that produced them. */
+
+static volatile uint32_t g_cur_arm_off = 0xFFFFFFFFu; /* 0xFFFFFFFF = "none" */
+static volatile uint32_t g_cur_code_len = 0;
+static volatile uint32_t g_cur_x86_pc = 0;
+/* The `cpu` pointer handed to func(cpu). Sampled from C, so it is always
+ * trustworthy, and it is the discriminator: the block's prologue does
+ * `mov r4, r0`, so if the fault-time R4 (available in the crash handler as
+ * uc->uc_mcontext.arm_r4) differs from g_cur_cpu, R4 diverged from the cpu
+ * pointer *inside* the block — an emitter/runtime bug. If they are equal the
+ * block was entered with the correct cpu. There is no separate "entry R4"
+ * sample: the block's R4 does not exist until the block starts. */
+static volatile uint32_t g_cur_cpu = 0;
+/* R4 as seen from dynrec_exec's OWN C frame, sampled immediately before
+ * func(cpu). This is NOT the block's R4 (the block sets R4 itself in its
+ * prologue). Its only use is the after-the-call comparison in dynrec_exec:
+ * once func(cpu) returns, the block's epilogue `pop {r4,...}` has restored R4,
+ * so a mismatch against this sample means the epilogue failed to restore R4. */
+static volatile uint32_t g_cur_r4_in = 0;
+
+/* Reading R4 needs real ARM codegen. dynrec.c is compiled for the host too
+ * (the offline harness defines __ARM_ARCH_5TE__ to exercise the translator
+ * on an x86 desktop), so gate on the actual architecture, not the guard. */
+#if defined(__arm__) || defined(__thumb__)
+static inline uint32_t dynrec_read_r4(void) {
+    uint32_t r4;
+    __asm__ __volatile__("mov %0, r4" : "=r"(r4));
+    return r4;
+}
+#else
+static inline uint32_t dynrec_read_r4(void) { return 0; }
+#endif
+
+int dynrec_get_code_cache(uintptr_t *base, uint32_t *size) {
+    if (!base || !size) return 0;
+    if (!code_cache_base) return 0;
+    *base = (uintptr_t)code_cache_base;
+    *size = CODE_CACHE_SIZE;
+    return 1;
+}
+
+int dynrec_get_current_block(uint32_t *arm_off, uint32_t *code_len, uint32_t *x86_pc) {
+    if (!arm_off || !code_len || !x86_pc) return 0;
+    *arm_off = g_cur_arm_off;
+    *code_len = g_cur_code_len;
+    *x86_pc = g_cur_x86_pc;
+    return 1;
+}
+
+/* *entry_cpu: the cpu pointer passed to func(cpu), sampled from C before the
+ * call and cleared to 0 after it returns — 0 means no block is active.
+ * *caller_r4: R4 of dynrec_exec's own C frame, sampled just before func(cpu).
+ * It is NOT the block's R4 and must not be compared against fault-time R4;
+ * compare *entry_cpu against fault-time R4 instead. */
+int dynrec_get_current_entry(uint32_t *entry_cpu, uint32_t *caller_r4) {
+    if (!entry_cpu || !caller_r4) return 0;
+    *entry_cpu = g_cur_cpu;
+    *caller_r4 = g_cur_r4_in;
+    return 1;
+}
+
+/* Copies up to `count` guest bytes at physical address x86_pc (= (cs<<4)+ip
+ * mod MEMORY_RANGE). Used by the native crash handler to report which x86
+ * opcode was being emulated when a helper faulted. Mirrors the access guard
+ * used by translate_block(): if the address is not direct-mapped RAM (NULL
+ * page or an MMIO callback), fills with 0xFF and keeps going so the handler
+ * can still show the instruction boundary it was working from. Returns the
+ * number of bytes written (always == count on the RAM path). */
+int dynrec_get_guest_bytes(uint32_t x86_pc, uint32_t count, uint8_t *out) {
+    uint32_t i;
+    if (count == 0 || out == NULL) return 0;
+    for (i = 0; i < count; i++) {
+        uint32_t addr = (x86_pc + i) & MEMORY_MASK;
+        uint8_t *page = memory_mapRead[addr];
+        if (page != NULL && memory_mapReadCallback[addr] == NULL) {
+            out[i] = *page;
+        } else {
+            out[i] = 0xFF;
+        }
+    }
+    return (int)i;
+}
+
 /* ---- Block cache ---- */
+
+/* Number of generated blocks currently executing, i.e. depth of the
+ * func(cpu) call in dynrec_exec(). flush_all_blocks() zeroes code_cache_pos
+ * and wipes the block cache; doing that while a block is running would make
+ * the running block's own code disappear underneath it and would let the
+ * next translation overwrite the very instructions still executing. Nothing
+ * calls it that way today, but that is an accident of the current call graph
+ * rather than a guarantee, so the depth is tracked and the flush refused. */
+static volatile int g_active_blocks = 0;
+
+static void flush_all_blocks(void) {
+    if (g_active_blocks > 0) {
+        /* Refuse rather than silently reset code_cache_pos under a running
+         * block: the correct outcome is that the cache fills up and translation
+         * starts failing, which is recoverable, rather than live code being
+         * overwritten mid-execution, which is not. */
+        crashlog("FLUSH_REFUSED: flush_all_blocks() called with %d block(s) "
+                 "active (code_cache_pos=%u) -- NOT flushing", g_active_blocks,
+                 (unsigned)code_cache_pos);
+        DLOGI("flush: refused, %d block(s) still executing", g_active_blocks);
+        return;
+    }
+    code_cache_pos = 0;
+    block_cache_count = 0;
+    memset(block_cache, 0, sizeof(block_cache));
+}
 
 static block_entry_t* find_block(uint32_t x86_pc) {
     for (int i = 0; i < block_cache_count; i++) {
-        if (block_cache[i].x86_pc == x86_pc) {
+        if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
             return &block_cache[i];
         }
     }
     return NULL;
 }
 
+/*
+	Append a block, reusing a slot freed by invalidation before growing.
+	Returns NULL only if all MAX_BLOCKS slots are genuinely live, which the
+	flush point in translate_block() should prevent.
+*/
+static block_entry_t* alloc_block_slot(void) {
+    for (int i = 0; i < block_cache_count; i++) {
+        if (!block_cache[i].valid) return &block_cache[i];
+    }
+    if (block_cache_count < MAX_BLOCKS) {
+        return &block_cache[block_cache_count++];
+    }
+    return NULL;
+}
+
 static void invalidate_block(uint32_t x86_pc) {
     for (int i = 0; i < block_cache_count; i++) {
-        if (block_cache[i].x86_pc == x86_pc) {
-            block_cache[i].x86_pc = 0;
+        if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
+            block_cache[i].valid = 0;
         }
     }
 }
@@ -264,11 +564,14 @@ extern int dinstr_push_r16(CPU_t* cpu, uint8_t regnum);
 extern int dinstr_pop_r16(CPU_t* cpu, uint8_t regnum);
 extern int dinstr_hlt(CPU_t* cpu);
 extern int dinstr_int(CPU_t* cpu, uint8_t intnum);
+extern int dinstr_mov_r8_imm8(CPU_t* cpu, uint8_t regnum, uint8_t imm);
+
 extern int dinstr_jmp_rel8(CPU_t* cpu, int8_t rel);
 extern int dinstr_jcond_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel);
 extern int dinstr_jmp_rel16(CPU_t* cpu, int16_t rel);
 extern int dinstr_call_rel16(CPU_t* cpu, int16_t rel);
 extern int dinstr_ret_near(CPU_t* cpu);
+extern int dinstr_loop_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel);
 extern int dinstr_add_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
 extern int dinstr_cmp_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
 extern int dinstr_add_al_imm8(CPU_t* cpu, uint8_t imm);
@@ -277,8 +580,6 @@ extern int dinstr_pushf(CPU_t* cpu);
 extern int dinstr_popf(CPU_t* cpu);
 extern int dinstr_inc_r8(CPU_t* cpu, uint8_t regnum);
 extern int dinstr_dec_r8(CPU_t* cpu, uint8_t regnum);
-extern int dinstr_add_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
-extern int dinstr_cmp_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
 extern int dinstr_push_es(CPU_t* cpu);
 extern int dinstr_pop_es(CPU_t* cpu);
 extern int dinstr_push_cs(CPU_t* cpu);
@@ -289,6 +590,12 @@ extern int dinstr_push_ds(CPU_t* cpu);
 extern int dinstr_pop_ds(CPU_t* cpu);
 extern int dinstr_sahf(CPU_t* cpu);
 extern int dinstr_lahf(CPU_t* cpu);
+extern int dinstr_advance_ip(CPU_t* cpu, uint16_t n);
+extern int dinstr_exec_one(CPU_t* cpu);
+
+/* TEST AL, Ib and TEST AX, Iv */
+extern int dinstr_test_al_imm8(CPU_t* cpu, uint8_t imm);
+extern int dinstr_test_ax_imm16(CPU_t* cpu, uint16_t imm);
 
 /* Opcodes 0x80-0x8F: ModR/M-based group and data-movement opcodes */
 extern int dinstr_test_gb_eb(CPU_t* cpu);
@@ -317,9 +624,466 @@ extern int dinstr_sbb_al_imm8(CPU_t* cpu, uint8_t imm);
 extern int dinstr_sbb_ax_imm16(CPU_t* cpu, uint16_t imm);
 extern int dinstr_and_al_imm8(CPU_t* cpu, uint8_t imm);
 extern int dinstr_and_ax_imm16(CPU_t* cpu, uint16_t imm);
-extern int dinstr_exec_one(CPU_t* cpu);
+
+/*
+ * On Android, libxtulator.so is built as a shared library (BUILD_SHARED_LIBRARY
+ * forces -fPIC on all sources). With -fPIC, taking the address of a function at
+ * *compile time* yields a link-time virtual address that the dynamic linker
+ * adjusts at load time. But `&func` in C already reflects the *link-time*
+ * address baked into the binary, NOT the runtime address after relocation.
+ *
+ * If we embed that link-time address into generated code, the BLX call lands
+ * at the wrong offset when the .so is loaded at a different base. This caused
+ * every dynrec helper call to hit cpu_exec's internal fetch loop instead of the
+ * intended helper, leading to an infinite `B .-4` spin and a crash at the code
+ * cache bounds.
+ *
+ * Fix: resolve every helper address at RUNTIME (in dynrec_enable, which runs
+ * after the library is loaded) and store them in this table. emit_bl then uses
+ * the stored runtime address, which is always correct regardless of PIC/PIE
+ * relocation.
+ */
+struct dynrec_helpers_t {
+    uint32_t dinstr_exec_one;
+    uint32_t dinstr_advance_ip;
+    uint32_t dinstr_nop;
+    uint32_t dinstr_mov_r_i;
+    uint32_t dinstr_inc_r16;
+    uint32_t dinstr_dec_r16;
+    uint32_t dinstr_push_r16;
+    uint32_t dinstr_pop_r16;
+    uint32_t dinstr_hlt;
+    uint32_t dinstr_int;
+    uint32_t dinstr_jmp_rel8;
+    uint32_t dinstr_jcond_rel8;
+    uint32_t dinstr_jmp_rel16;
+    uint32_t dinstr_call_rel16;
+    uint32_t dinstr_ret_near;
+    uint32_t dinstr_add_r16_imm;
+    uint32_t dinstr_cmp_r16_imm;
+    uint32_t dinstr_add_al_imm8;
+    uint32_t dinstr_add_ax_imm16;
+    uint32_t dinstr_pushf;
+    uint32_t dinstr_popf;
+    uint32_t dinstr_inc_r8;
+    uint32_t dinstr_dec_r8;
+    uint32_t dinstr_push_es;
+    uint32_t dinstr_pop_es;
+    uint32_t dinstr_push_cs;
+    uint32_t dinstr_pop_cs;
+    uint32_t dinstr_push_ss;
+    uint32_t dinstr_pop_ss;
+    uint32_t dinstr_push_ds;
+    uint32_t dinstr_pop_ds;
+    uint32_t dinstr_sahf;
+    uint32_t dinstr_lahf;
+    uint32_t dinstr_test_al_imm8;
+    uint32_t dinstr_test_ax_imm16;
+    uint32_t dinstr_or_al_imm8;
+    uint32_t dinstr_or_ax_imm16;
+    uint32_t dinstr_xor_al_imm8;
+    uint32_t dinstr_xor_ax_imm16;
+    uint32_t dinstr_sub_al_imm8;
+    uint32_t dinstr_sub_ax_imm16;
+    uint32_t dinstr_cmp_al_imm8;
+    uint32_t dinstr_cmp_ax_imm16;
+    uint32_t dinstr_adc_al_imm8;
+    uint32_t dinstr_adc_ax_imm16;
+    uint32_t dinstr_sbb_al_imm8;
+    uint32_t dinstr_sbb_ax_imm16;
+    uint32_t dinstr_and_al_imm8;
+    uint32_t dinstr_and_ax_imm16;
+    uint32_t dinstr_mov_r8_imm8;
+    uint32_t dinstr_loop_rel8;
+    uint32_t dinstr_test_gb_eb;
+    uint32_t dinstr_test_gv_ev;
+    uint32_t dinstr_mov_ew_sw;
+    uint32_t dinstr_lea_gv_m;
+    uint32_t dinstr_mov_sw_ew;
+    uint32_t dinstr_cmc;
+    uint32_t dinstr_clc;
+    uint32_t dinstr_stc;
+    uint32_t dinstr_cli;
+    uint32_t dinstr_sti;
+    uint32_t dinstr_cld;
+    uint32_t dinstr_std;
+};
+static struct dynrec_helpers_t g_helpers;
+
+/* Emit a call to dinstr_advance_ip() to advance cpu->ip by n bytes.
+ * See the forward declaration above for why this is needed. */
+static void emit_advance_ip(uint32_t n) {
+    if (n == 0) return;
+    emit_mov_reg(0, 4);            /* R0 = cpu */
+    /* A block can span MAX_INSTRUCTIONS * 3 bytes (>255), so this must be
+     * a full 16-bit immediate, not emit_mov_imm. */
+    emit_movw(1, (uint16_t)n);     /* R1 = byte count */
+    emit_bl(g_helpers.dinstr_advance_ip);
+}
+
+/* Resolve all dynrec helper function addresses at runtime. Must be called
+ * after the shared library is loaded (i.e. from dynrec_enable()). */
+static void dynrec_resolve_helpers(void) {
+    g_helpers.dinstr_exec_one    = (uint32_t)(uintptr_t)&dinstr_exec_one;
+    g_helpers.dinstr_advance_ip  = (uint32_t)(uintptr_t)&dinstr_advance_ip;
+    g_helpers.dinstr_nop         = (uint32_t)(uintptr_t)&dinstr_nop;
+    g_helpers.dinstr_mov_r_i     = (uint32_t)(uintptr_t)&dinstr_mov_r_i;
+    g_helpers.dinstr_inc_r16     = (uint32_t)(uintptr_t)&dinstr_inc_r16;
+    g_helpers.dinstr_dec_r16     = (uint32_t)(uintptr_t)&dinstr_dec_r16;
+    g_helpers.dinstr_push_r16    = (uint32_t)(uintptr_t)&dinstr_push_r16;
+    g_helpers.dinstr_pop_r16     = (uint32_t)(uintptr_t)&dinstr_pop_r16;
+    g_helpers.dinstr_hlt         = (uint32_t)(uintptr_t)&dinstr_hlt;
+    g_helpers.dinstr_int         = (uint32_t)(uintptr_t)&dinstr_int;
+    g_helpers.dinstr_jmp_rel8    = (uint32_t)(uintptr_t)&dinstr_jmp_rel8;
+    g_helpers.dinstr_jcond_rel8  = (uint32_t)(uintptr_t)&dinstr_jcond_rel8;
+    g_helpers.dinstr_jmp_rel16   = (uint32_t)(uintptr_t)&dinstr_jmp_rel16;
+    g_helpers.dinstr_call_rel16  = (uint32_t)(uintptr_t)&dinstr_call_rel16;
+    g_helpers.dinstr_ret_near    = (uint32_t)(uintptr_t)&dinstr_ret_near;
+    g_helpers.dinstr_add_r16_imm = (uint32_t)(uintptr_t)&dinstr_add_r16_imm;
+    g_helpers.dinstr_cmp_r16_imm = (uint32_t)(uintptr_t)&dinstr_cmp_r16_imm;
+    g_helpers.dinstr_add_al_imm8 = (uint32_t)(uintptr_t)&dinstr_add_al_imm8;
+    g_helpers.dinstr_add_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_add_ax_imm16;
+    g_helpers.dinstr_pushf       = (uint32_t)(uintptr_t)&dinstr_pushf;
+    g_helpers.dinstr_popf        = (uint32_t)(uintptr_t)&dinstr_popf;
+    g_helpers.dinstr_inc_r8      = (uint32_t)(uintptr_t)&dinstr_inc_r8;
+    g_helpers.dinstr_dec_r8      = (uint32_t)(uintptr_t)&dinstr_dec_r8;
+    g_helpers.dinstr_push_es     = (uint32_t)(uintptr_t)&dinstr_push_es;
+    g_helpers.dinstr_pop_es      = (uint32_t)(uintptr_t)&dinstr_pop_es;
+    g_helpers.dinstr_push_cs     = (uint32_t)(uintptr_t)&dinstr_push_cs;
+    g_helpers.dinstr_pop_cs      = (uint32_t)(uintptr_t)&dinstr_pop_cs;
+    g_helpers.dinstr_push_ss     = (uint32_t)(uintptr_t)&dinstr_push_ss;
+    g_helpers.dinstr_pop_ss      = (uint32_t)(uintptr_t)&dinstr_pop_ss;
+    g_helpers.dinstr_push_ds     = (uint32_t)(uintptr_t)&dinstr_push_ds;
+    g_helpers.dinstr_pop_ds      = (uint32_t)(uintptr_t)&dinstr_pop_ds;
+    g_helpers.dinstr_sahf        = (uint32_t)(uintptr_t)&dinstr_sahf;
+    g_helpers.dinstr_lahf        = (uint32_t)(uintptr_t)&dinstr_lahf;
+    g_helpers.dinstr_mov_r8_imm8  = (uint32_t)(uintptr_t)&dinstr_mov_r8_imm8;
+    g_helpers.dinstr_loop_rel8    = (uint32_t)(uintptr_t)&dinstr_loop_rel8;
+    g_helpers.dinstr_test_al_imm8 = (uint32_t)(uintptr_t)&dinstr_test_al_imm8;
+    g_helpers.dinstr_test_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_test_ax_imm16;
+    g_helpers.dinstr_or_al_imm8  = (uint32_t)(uintptr_t)&dinstr_or_al_imm8;
+    g_helpers.dinstr_or_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_or_ax_imm16;
+    g_helpers.dinstr_xor_al_imm8 = (uint32_t)(uintptr_t)&dinstr_xor_al_imm8;
+    g_helpers.dinstr_xor_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_xor_ax_imm16;
+    g_helpers.dinstr_sub_al_imm8 = (uint32_t)(uintptr_t)&dinstr_sub_al_imm8;
+    g_helpers.dinstr_sub_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_sub_ax_imm16;
+    g_helpers.dinstr_cmp_al_imm8 = (uint32_t)(uintptr_t)&dinstr_cmp_al_imm8;
+    g_helpers.dinstr_cmp_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_cmp_ax_imm16;
+    g_helpers.dinstr_adc_al_imm8 = (uint32_t)(uintptr_t)&dinstr_adc_al_imm8;
+    g_helpers.dinstr_adc_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_adc_ax_imm16;
+    g_helpers.dinstr_sbb_al_imm8 = (uint32_t)(uintptr_t)&dinstr_sbb_al_imm8;
+    g_helpers.dinstr_sbb_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_sbb_ax_imm16;
+    g_helpers.dinstr_and_al_imm8 = (uint32_t)(uintptr_t)&dinstr_and_al_imm8;
+    g_helpers.dinstr_and_ax_imm16 = (uint32_t)(uintptr_t)&dinstr_and_ax_imm16;
+    g_helpers.dinstr_test_gb_eb  = (uint32_t)(uintptr_t)&dinstr_test_gb_eb;
+    g_helpers.dinstr_test_gv_ev  = (uint32_t)(uintptr_t)&dinstr_test_gv_ev;
+    g_helpers.dinstr_mov_ew_sw   = (uint32_t)(uintptr_t)&dinstr_mov_ew_sw;
+    g_helpers.dinstr_lea_gv_m    = (uint32_t)(uintptr_t)&dinstr_lea_gv_m;
+    g_helpers.dinstr_mov_sw_ew   = (uint32_t)(uintptr_t)&dinstr_mov_sw_ew;
+    g_helpers.dinstr_cmc         = (uint32_t)(uintptr_t)&dinstr_cmc;
+    g_helpers.dinstr_clc         = (uint32_t)(uintptr_t)&dinstr_clc;
+    g_helpers.dinstr_stc         = (uint32_t)(uintptr_t)&dinstr_stc;
+    g_helpers.dinstr_cli         = (uint32_t)(uintptr_t)&dinstr_cli;
+    g_helpers.dinstr_sti         = (uint32_t)(uintptr_t)&dinstr_sti;
+    g_helpers.dinstr_cld         = (uint32_t)(uintptr_t)&dinstr_cld;
+    g_helpers.dinstr_std         = (uint32_t)(uintptr_t)&dinstr_std;
+
+    DLOGI("dynrec: resolved helper addresses (dinstr_exec_one=0x%08X)",
+          g_helpers.dinstr_exec_one);
+}
 
 /* ---- Block translation ---- */
+
+/*
+ * Length-only x86 instruction decoder.
+ *
+ * WHY THIS EXISTS. Every opcode the translator hands to the interpreter via
+ * dinstr_exec_one() used to advance `offset` by exactly 1. That is wrong in
+ * two places that matter:
+ *
+ *   - block->x86_len is the block's invalidation footprint (see
+ *     dynrec_invalidate_range, which tests [x86_pc, x86_pc + x86_len) for
+ *     overlap with a write). With a 1-byte charge, the ModR/M, SIB,
+ *     displacement and immediate bytes of a deferred instruction lay OUTSIDE
+ *     the block's range, so a self-modifying-code patch or a code load
+ *     landing on any of them failed to invalidate the block and the stale
+ *     translation was executed again.
+ *   - block->x86_end_ip / expected_end_ip is cpu->ip + x86_len, so an
+ *     IP-desync recovery would resume at the deferred instruction's own
+ *     opcode byte and re-execute it forever.
+ *
+ * The alternative considered and rejected was a conservative footprint
+ * (treat x86_len as a lower bound and additionally invalidate any block
+ * within MAX_INSTRUCTIONS*6 bytes of a write). That fixes invalidation but
+ * leaves x86_end_ip wrong and invalidates blocks that cannot possibly be
+ * touched, so it degrades into a near-useless cache. Decoding the length is
+ * the honest fix; the cost is bounded because the decode is a handful of
+ * table lookups and happens once per instruction at translation time.
+ *
+ * CONTRACT: this function never UNDER-estimates. An over-estimate only widens
+ * the invalidation footprint (safe: a spurious retranslation) and only
+ * perturbs x86_end_ip, which is consulted solely on the IP-desync recovery
+ * path. An unrecognised encoding therefore returns a generous upper bound
+ * rather than guessing low. This decoder computes LENGTH ONLY -- it never
+ * interprets operands, which is exactly the work dinstr_exec_one() is called
+ * to do.
+ */
+static int x86_is_prefix(uint8_t b) {
+    return b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x64 ||
+           b == 0x65 || b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 ||
+           b == 0xF3;
+}
+
+/* Length of the instruction at mem[0..avail). `avail` is how many bytes may be
+ * read; the result is clamped to it so a truncated encoding at the top of the
+ * address space cannot make the translator run off the mapped region. */
+static uint32_t x86_instr_len(const uint8_t *mem, uint32_t avail) {
+    uint32_t i = 0;
+    int opsz16 = 0;   /* 0x66: operand size 16 -> 32, so Iv/rel widen to 32-bit */
+    int adsz32 = 0;   /* 0x67: address size 16 -> 32: disp32, and the SIB byte
+                         becomes possible (it does NOT exist in 16-bit mode) */
+    uint8_t op, op2 = 0, m;
+    int has_modrm = 0;
+    uint32_t imm = 0;
+
+    /* Legacy prefix run. Capped so a run of 0x90-adjacent junk cannot walk
+     * the whole address space; the real limit is 4 prefixes on 386+. */
+    while (i < avail && i < 4 && x86_is_prefix(mem[i])) {
+        if (mem[i] == 0x66) opsz16 = 1;
+        else if (mem[i] == 0x67) adsz32 = 1;
+        i++;
+    }
+    if (i >= avail) return i;              /* truncated: prefix run only */
+
+    op = mem[i++];
+
+    if (op == 0x0F) {
+        if (i >= avail) return i;
+        op2 = mem[i++];
+        if (op2 >= 0x80 && op2 <= 0x8F) {
+            imm = opsz16 ? 4 : 2;          /* Jcc rel16/rel32 */
+        } else if (op2 == 0x05 || op2 == 0x06 || op2 == 0x07 || op2 == 0x08 ||
+                   op2 == 0x09 || op2 == 0x0B || op2 == 0x0E || op2 == 0x30 ||
+                   op2 == 0x31 || op2 == 0x32 || op2 == 0x33 || op2 == 0x34 ||
+                   op2 == 0x35 || op2 == 0x37 || op2 == 0x77 ||
+                   (op2 >= 0xA0 && op2 <= 0xA1) ||   /* PUSH/POP FS */
+                   (op2 >= 0xA8 && op2 <= 0xA9) ||   /* PUSH/POP GS */
+                   (op2 >= 0xC8 && op2 <= 0xCF)) {   /* BSWAP */
+            imm = 0;                        /* no operands at all */
+        } else if (op2 == 0x0F) {
+            has_modrm = 1; imm = 1;         /* 3DNow!: imm8 trails the ModR/M */
+        } else if (op2 == 0x0D || op2 == 0x1F ||
+                   (op2 >= 0x18 && op2 <= 0x1E)) {
+            has_modrm = 1;                   /* PREFETCH / NOP Ev: no immediate */
+        } else if (op2 == 0x70 || op2 == 0x71 || op2 == 0x72 || op2 == 0x73 ||
+                   op2 == 0xBA || (op2 >= 0xC2 && op2 <= 0xC6)) {
+            /* The 0F opcodes that do carry a trailing immediate (shift-group
+             * imm8, BT/BTS/BTR/BTC imm8, CMPPS/CMPSS/... imm8). */
+            has_modrm = 1;
+            imm = 1;
+        } else if (op2 == 0xA4 || op2 == 0xA5 ||
+                   op2 == 0xAC || op2 == 0xAD) {
+            /* SHLD/SHRD. The register form (mod=11) carries an imm8, the
+             * memory form shifts by CL and carries none; charging the imm8
+             * unconditionally over-counts the memory form by one byte, which
+             * is the safe direction, and gets the register form right. */
+            has_modrm = 1;
+            imm = 1;
+        } else if (op2 == 0xA0 || op2 == 0xA1 || op2 == 0xA2 ||
+                   op2 == 0xA8 || op2 == 0xA9 || op2 == 0xAA) {
+            /* PUSH/POP FS/GS and MOV to/from them use a moffs operand, not a
+             * ModR/M: the address is a bare 16- or 32-bit offset. */
+            imm = adsz32 ? 4 : 2;
+        } else {
+            /* Every other 0F opcode is ModR/M with no trailing immediate --
+             * MOVZX/MOVSX, SETcc, CMOVcc, CMPXCHG, the SSE/MMX groups and so
+             * on. Defaulting here (rather than charging an immediate) keeps
+             * the length exact for the very common `0F 94 /0` SETcc and
+             * `0F 44 /0` CMOVcc forms, which the interpreter fallback sees all
+             * the time in 16-bit code. */
+            has_modrm = 1;
+        }
+    } else if (op < 0x40 && (op & 7) <= 3) {
+        has_modrm = 1;                      /* ADD/OR/ADC/SBB/AND/SUB/XOR/CMP Ev */
+    } else {
+        /*
+         * One exhaustive switch. Every case is listed explicitly, including
+         * the ones that take no operands, so that `default:` really does mean
+         * "encoding not modelled here" and can return a conservative bound
+         * without corrupting the known-correct opcodes.
+         */
+        switch (op) {
+        /* --- 0x00-0x3F, non-ModR/M forms --- */
+        case 0x04: case 0x0C: case 0x14: case 0x1C:
+        case 0x24: case 0x2C: case 0x34: case 0x3C:
+            imm = 1; break;                          /* AL, Ib */
+        case 0x05: case 0x0D: case 0x15: case 0x1D:
+        case 0x25: case 0x2D: case 0x35: case 0x3D:
+            imm = opsz16 ? 4 : 2; break;             /* eAX, Iv */
+        case 0x06: case 0x07: case 0x0E: case 0x16:
+        case 0x17: case 0x1E: case 0x1F:
+        case 0x26: case 0x27: case 0x2E: case 0x2F:
+        case 0x37: case 0x3E: case 0x3F:
+            break;                                   /* PUSH/POP Sreg, DAA family */
+        /* --- 0x40-0x6F: INC/DEC r16, PUSH/POP r16, PUSHA/POPA --- */
+        case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45:
+        case 0x46: case 0x47: case 0x48: case 0x49: case 0x4A: case 0x4B:
+        case 0x4C: case 0x4D: case 0x4E: case 0x4F:
+        case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55:
+        case 0x56: case 0x57: case 0x58: case 0x59: case 0x5A: case 0x5B:
+        case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+        case 0x60: case 0x61: break;        /* INC/DEC/PUSH/POP r16, PUSHA/POPA */
+        case 0x62: has_modrm = 1; break;              /* BOUND Gv,Ma */
+        case 0x63: has_modrm = 1; break;              /* ARPL Ew,Gw */
+        case 0x68: imm = opsz16 ? 4 : 2; break;       /* PUSH Iv */
+        case 0x69: has_modrm = 1; imm = opsz16 ? 4 : 2; break;  /* IMUL Gv,Ev,Iv */
+        case 0x6A: imm = 1; break;                    /* PUSH imm8 */
+        case 0x6B: has_modrm = 1; imm = 1; break;     /* IMUL Gv,Ev,Ib */
+        /* --- 0x70-0x7F: Jcc rel8 --- */
+        case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
+        case 0x76: case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B:
+        case 0x7C: case 0x7D: case 0x7E: case 0x7F:
+            imm = 1; break;
+        /* --- 0x80-0x8F: group 1 and the ModR/M data-movement block --- */
+        case 0x80: case 0x82: case 0x83:
+            has_modrm = 1; imm = 1; break;           /* Eb/Ib, Ev/Ib (sign-ext) */
+        case 0x81:
+            has_modrm = 1; imm = opsz16 ? 4 : 2; break;   /* Ev/Iv */
+        case 0x84: case 0x85: case 0x86: case 0x87: case 0x88: case 0x89:
+        case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E: case 0x8F:
+            has_modrm = 1; break;                     /* ModR/M, no immediate */
+        /* --- 0x90-0x9F --- */
+        case 0x9A:                        /* CALL far ptr: seg:off */
+            imm = (opsz16 ? 4 : 2) + (adsz32 ? 4 : 2);
+            break;
+        /* --- 0xA0-0xAF: moffs and the string instructions --- */
+        case 0xA0: case 0xA1: case 0xA2: case 0xA3:
+            imm = adsz32 ? 4 : 2; break;              /* AL/eAX, moffs */
+        case 0xA4: case 0xA5: case 0xA6: case 0xA7:   /* MOVS/CMPS */
+        case 0xAA: case 0xAB: case 0xAC: case 0xAD:   /* STOS/LODS */
+        case 0xAE: case 0xAF:                         /* SCAS */
+            break;                                    /* no operands */
+        /* --- 0xB0-0xBF --- */
+        case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+        case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+            imm = 1; break;                            /* MOV r8, Ib */
+        case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+        case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+            imm = opsz16 ? 4 : 2; break;               /* MOV r16/r32, Iv */
+        /* --- 0xC0-0xCF --- */
+        case 0xC0: case 0xC1: has_modrm = 1; imm = 1; break;   /* shift Grp2, imm8 */
+        case 0xC2: imm = opsz16 ? 4 : 2; break;                 /* RET imm16 */
+        case 0xC4: case 0xC5:                                     /* LES/LDS */
+            /* The far POINTER is read from memory, not encoded inline, so
+             * there is no immediate here -- unlike CALL/JMP FAR (0x9A/0xEA),
+             * which do carry one. `les ax,[bx]` is 2 bytes. */
+            has_modrm = 1;
+            break;
+        case 0xC6: has_modrm = 1; imm = 1; break;               /* MOV Eb, Ib */
+        case 0xC7: has_modrm = 1; imm = opsz16 ? 4 : 2; break;  /* MOV Ev, Iv */
+        case 0xC8: imm = 3; break;                               /* ENTER Iv, Ib */
+        case 0xCA: case 0xCB: imm = opsz16 ? 4 : 2; break;       /* RETF imm16 */
+        case 0xCD: imm = 1; break;                               /* INT imm8 */
+        /* --- 0xD0-0xDF: shift group 2, AAM/AAD, x87 --- */
+        case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+            has_modrm = 1; break;
+        case 0xD4: case 0xD5: imm = 1; break;                    /* AAM/AAD Ib */
+        case 0xD6: case 0xD7: break;                             /* SALC, XLAT */
+        case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95:
+        case 0x96: case 0x97: case 0x98:
+        case 0x9B: case 0x9C: case 0x9D: case 0x9E: case 0x9F:
+        case 0xF4: case 0xF5: case 0xF8: case 0xF9: case 0xFA:
+        case 0xFB: case 0xFC: case 0xFD:
+            break;                                    /* no operands */
+        case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+        case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+            has_modrm = 1; break;                                 /* x87 escape */
+        /* --- 0xE0-0xEF --- */
+        case 0xE0: case 0xE1: case 0xE2: case 0xE3:
+        case 0xE4: case 0xE5: case 0xE6: case 0xE7:
+            imm = 1; break;                            /* loop/jcxz/IN/OUT Ib */
+        case 0xE8: case 0xE9: imm = opsz16 ? 4 : 2; break;  /* CALL/JMP rel */
+        case 0xEA:                        /* JMP far ptr: seg:off */
+            imm = (opsz16 ? 4 : 2) + (adsz32 ? 4 : 2);
+            break;
+        case 0xEB: imm = 1; break;                               /* JMP rel8 */
+        case 0xEC: case 0xED: case 0xEE: case 0xEF: break;        /* IN/OUT DX */
+        /* --- 0xF0-0xFF --- */
+        case 0xF6: case 0xF7:
+            /* TEST's immediate depends on the reg field of the ModR/M, which
+             * is only known after the ModR/M byte is read -- handled below. */
+            has_modrm = 1;
+            break;
+        case 0xFE: case 0xFF:
+            has_modrm = 1; break;                     /* INC/DEC/CALL/JMP/PUSH Ev */
+        default:
+            /*
+             * Not modelled. Charge the longest immediate a 16-bit-mode
+             * encoding can carry so the answer stays an UPPER bound: an
+             * over-long charge only widens the invalidation footprint, which
+             * is safe, whereas an under-charge would leave bytes of a live
+             * instruction outside the block and let a patch to them go
+             * unnoticed. In practice this is unreachable -- the translator
+             * only calls the decoder for the opcode groups it defers to the
+             * interpreter, and every one of those is a case above.
+             */
+            imm = 4;
+            break;
+        }
+    }
+
+    if (has_modrm) {
+        if (i >= avail) return i;
+        m = mem[i++];
+        /*
+         * The ModR/M reg field decides some immediates, and it has to be
+         * consulted for BOTH mod=11 (register) and mod!=11 (memory) forms:
+         * F6 /0 and F7 /0 are TEST with an immediate, and `F6 06 3E` is a
+         * 5-byte memory-form TEST, not 4.
+         */
+        if (op == 0xF6 || op == 0xF7) {
+            if (((m >> 3) & 7) <= 1)
+                imm = (op == 0xF6) ? 1 : (opsz16 ? 4 : 2);
+        }
+        if ((m >> 6) != 3) {                  /* not register-direct */
+            uint8_t mod = (uint8_t)(m >> 6);
+            uint8_t rm = (uint8_t)(m & 7);
+            if (adsz32) {
+                /* 32-bit addressing (0x67). Here rm=100 really does mean "a
+                 * SIB byte follows" and rm=101/mod=0 means disp32. */
+                if (rm == 4) {                /* SIB byte follows */
+                    uint8_t sib;
+                    if (i >= avail) return i;
+                    sib = mem[i++];
+                    if ((sib & 7) == 5) i += 4;       /* disp32, no base */
+                } else if (rm == 5 && mod == 0) {
+                    i += 4;                              /* disp32, no base */
+                }
+                if (mod == 1)      i += 1;
+                else if (mod == 2) i += 4;
+            } else {
+                /*
+                 * 16-bit addressing. THE SIB BYTE DOES NOT EXIST HERE: rm=100
+                 * is [SI], rm=101 is [DI] and rm=110 is [BP]. Only [BP] with
+                 * mod=0 needs a displacement (disp16). Decoding rm=100 as a
+                 * SIB in 16-bit mode -- the obvious mistake -- inflates or
+                 * deflates the length of every [SI+..] instruction.
+                 */
+                if (rm == 6 && mod == 0) i += 2;        /* [BP] -> disp16 */
+                else if (mod == 1)      i += 1;
+                else if (mod == 2)      i += 2;
+            }
+        } else if (op >= 0xD8 && op <= 0xDF) {
+            /* Register-direct x87 escapes with reg >= 4 take an imm8. */
+            if (((m >> 3) & 7) >= 4) imm = 1;
+        }
+    }
+
+    i += imm;
+    if (i > avail) i = avail;
+    if (i == 0) i = 1;
+    return i;
+}
 
 static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
     uint8_t* mem = memory_mapRead[x86_pc & MEMORY_MASK];
@@ -328,6 +1092,17 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
     }
 
     uint32_t start_pos = code_cache_pos;
+
+    /*
+	Flush before we run out of code cache. Dead blocks leave unreachable
+	code behind, so without this the cache would fill up permanently and
+	every later translation would fail. This also guarantees the block
+	cache has room for a fresh block.
+    */
+    if (code_cache_pos + CODE_CACHE_FLUSH_MARGIN >= CODE_CACHE_SIZE) {
+        flush_all_blocks();
+        start_pos = 0;
+    }
 
     /* Check if block cache is full */
     if (block_cache_count >= MAX_BLOCKS) {
@@ -343,13 +1118,19 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
 
     int instr_count = 0;
     int offset = 0;
-    int has_native_instrs = 0;  /* Track if any natively-translated instructions were emitted */
+    /* Bytes of already-emitted instructions not yet folded into cpu->ip.
+     * Flushed at the top of each iteration so that any helper which reads
+     * cpu->ip (dinstr_exec_one, jmp/call/ret/int) sees the address of the
+     * instruction it is about to run rather than the block's first byte. */
+    uint32_t pending_ip = 0;
 
     while (instr_count < max_instr) {
-        uint8_t opcode = mem[offset];
+        /* Commit the IP advance owed by previously emitted instructions. */
+        emit_advance_ip(pending_ip);
+        pending_ip = 0;
 
-        /* Assume native instruction until proven otherwise */
-        has_native_instrs = 1;
+        uint32_t prev_offset = (uint32_t)offset;
+        uint8_t opcode = mem[offset];
 
         switch (opcode) {
         /* ---- x86 prefix bytes — skip and continue to next opcode ---- */
@@ -363,31 +1144,53 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x67:  /* Address size override prefix */
         case 0xF3:  /* REP/REPE/REPZ prefix */
         case 0xF2:  /* REPNE/REPNZ prefix */
-            offset++;
-            break;
+            /* A prefix is not an instruction on its own — it modifies how
+             * the FOLLOWING opcode decodes (operand size, segment, REP
+             * count). Advancing past it and translating the next opcode
+             * natively would silently drop that effect, e.g. "66 89 06"
+             * (16-bit MOV) being run as an 8-bit MOV. So hand the whole
+             * prefixed instruction to the interpreter, which re-reads the
+             * prefix itself. */
+            emit_mov_reg(0, 4);
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
+            instr_count++;
+            goto block_done;
 
         case 0x0F:  /* Two-byte opcode escape (0F xx) — defer to interpreter */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
         /* ---- ADD opcodes (0x00-0x05) ---- */
         case 0x00: case 0x01: case 0x02: case 0x03:
             /* ADD Eb,Gb / ADD Ev,Gv / ADD Gb,Eb / ADD Gv,Ev — ModR/M forms */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
-            has_native_instrs = 0;
             goto block_done;
 
         case 0x04:  /* ADD AL, Ib */
             emit_mov_reg(0, 4);  /* R0 = cpu (saved in R4) */
             emit_mov_imm(1, mem[offset + 1]);  /* R1 = imm8 */
-            emit_bl((uint32_t)&dinstr_add_al_imm8);
+            emit_bl(g_helpers.dinstr_add_al_imm8);
             offset += 2;
             break;
 
@@ -396,7 +1199,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
                 uint16_t imm = mem[offset + 1] | (mem[offset + 2] << 8);
                 emit_mov_reg(0, 4);  /* R0 = cpu */
                 emit_movw(1, imm);  /* R1 = imm16 */
-                emit_bl((uint32_t)&dinstr_add_ax_imm16);
+                emit_bl(g_helpers.dinstr_add_ax_imm16);
             }
             offset += 3;
             break;
@@ -405,16 +1208,20 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x28: case 0x29: case 0x2A: case 0x2B:
             /* SUB Eb,Gb / SUB Ev,Gv / SUB Gb,Eb / SUB Gv,Ev — ModR/M forms */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x2C:  /* SUB AL, Ib */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_sub_al_imm8);
+            emit_bl(g_helpers.dinstr_sub_al_imm8);
             offset += 2;
             break;
 
@@ -423,7 +1230,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
                 uint16_t imm = mem[offset + 1] | (mem[offset + 2] << 8);
                 emit_mov_reg(0, 4);
                 emit_movw(1, imm);
-                emit_bl((uint32_t)&dinstr_sub_ax_imm16);
+                emit_bl(g_helpers.dinstr_sub_ax_imm16);
             }
             offset += 3;
             break;
@@ -432,16 +1239,20 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x38: case 0x39: case 0x3A: case 0x3B:
             /* CMP Eb,Gb / CMP Ev,Gv / CMP Gb,Eb / CMP Gv,Ev — ModR/M forms */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x3C:  /* CMP AL, Ib */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_cmp_al_imm8);
+            emit_bl(g_helpers.dinstr_cmp_al_imm8);
             offset += 2;
             break;
 
@@ -450,14 +1261,14 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
                 uint16_t imm = mem[offset + 1] | (mem[offset + 2] << 8);
                 emit_mov_reg(0, 4);
                 emit_movw(1, imm);
-                emit_bl((uint32_t)&dinstr_cmp_ax_imm16);
+                emit_bl(g_helpers.dinstr_cmp_ax_imm16);
             }
             offset += 3;
             break;
 
         case 0x90:  /* NOP */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_nop);
+            emit_bl(g_helpers.dinstr_nop);
             offset++;
             break;
 
@@ -468,7 +1279,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             emit_mov_reg(0, 4);  /* R0 = cpu */
             emit_movw(1, regnum);
             emit_movw(2, mem[offset + 1] | (mem[offset + 2] << 8));
-            emit_bl((uint32_t)&dinstr_mov_r_i);
+            emit_bl(g_helpers.dinstr_mov_r_i);
             offset += 3;
             break;
         }
@@ -478,7 +1289,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             /* INC eXX */
             emit_mov_reg(0, 4);
             emit_movw(1, (uint16_t)(opcode - 0x40));
-            emit_bl((uint32_t)&dinstr_inc_r16);
+            emit_bl(g_helpers.dinstr_inc_r16);
             offset++;
             break;
 
@@ -487,7 +1298,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             /* DEC eXX */
             emit_mov_reg(0, 4);
             emit_movw(1, (uint16_t)(opcode - 0x48));
-            emit_bl((uint32_t)&dinstr_dec_r16);
+            emit_bl(g_helpers.dinstr_dec_r16);
             offset++;
             break;
 
@@ -496,7 +1307,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             /* PUSH eXX */
             emit_mov_reg(0, 4);
             emit_movw(1, (uint16_t)(opcode - 0x50));
-            emit_bl((uint32_t)&dinstr_push_r16);
+            emit_bl(g_helpers.dinstr_push_r16);
             offset++;
             break;
 
@@ -505,25 +1316,37 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             /* POP eXX */
             emit_mov_reg(0, 4);
             emit_movw(1, (uint16_t)(opcode - 0x58));
-            emit_bl((uint32_t)&dinstr_pop_r16);
+            emit_bl(g_helpers.dinstr_pop_r16);
             offset++;
+            break;
+
+        case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+        case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+            /* MOV r8, Ib */
+            emit_mov_reg(0, 4);
+            emit_movw(1, (uint16_t)(opcode - 0xB0));
+            emit_mov_imm(2, mem[offset + 1]);
+            emit_bl(g_helpers.dinstr_mov_r8_imm8);
+            offset += 2;
+            pending_ip += 2;
+            instr_count++;
             break;
 
         case 0x9C:  /* PUSHF */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_pushf);
+            emit_bl(g_helpers.dinstr_pushf);
             offset++;
             break;
 
         case 0x9D:  /* POPF */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_popf);
+            emit_bl(g_helpers.dinstr_popf);
             offset++;
             break;
 
         case 0xC3:  /* RET (near) */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_ret_near);
+            emit_bl(g_helpers.dinstr_ret_near);
             offset++;
             instr_count++;
             goto block_done;
@@ -531,7 +1354,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0xCD:  /* INT imm8 */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_int);
+            emit_bl(g_helpers.dinstr_int);
             offset += 2;
             instr_count++;
             goto block_done;
@@ -541,7 +1364,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
                 int16_t rel = mem[offset + 1] | (mem[offset + 2] << 8);
                 emit_mov_reg(0, 4);
                 emit_movw(1, (uint16_t)rel);
-                emit_bl((uint32_t)&dinstr_call_rel16);
+                emit_bl(g_helpers.dinstr_call_rel16);
             }
             offset += 3;
             instr_count++;
@@ -552,7 +1375,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
                 int16_t rel = mem[offset + 1] | (mem[offset + 2] << 8);
                 emit_mov_reg(0, 4);
                 emit_movw(1, (uint16_t)rel);
-                emit_bl((uint32_t)&dinstr_jmp_rel16);
+                emit_bl(g_helpers.dinstr_jmp_rel16);
             }
             offset += 3;
             instr_count++;
@@ -561,28 +1384,42 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0xEB:  /* JMP rel8 */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, (uint8_t)mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_jmp_rel8);
+            emit_bl(g_helpers.dinstr_jmp_rel8);
+            offset += 2;
+            instr_count++;
+            goto block_done;
+
+        case 0xE0: case 0xE1: case 0xE2: case 0xE3:
+            /* LOOPNE/LOOPZ/LOOP/JCXZ rel8 */
+            emit_mov_reg(0, 4);
+            emit_mov_imm(1, opcode);
+            emit_mov_imm(2, (uint8_t)mem[offset + 1]);
+            emit_bl(g_helpers.dinstr_loop_rel8);
             offset += 2;
             instr_count++;
             goto block_done;
 
         case 0xF4:  /* HLT */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_hlt);
+            emit_bl(g_helpers.dinstr_hlt);
             offset++;
+            /* dinstr_hlt only sets hltstate; unlike the other terminators
+             * it does not advance cpu->ip past its own byte, so account for
+             * that byte here or the IP will stay parked on the HLT. */
+            pending_ip += 1;
             instr_count++;
             goto block_done;
 
         /* ---- Segment register operations ---- */
         case 0x06:  /* PUSH ES */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_push_es);
+            emit_bl(g_helpers.dinstr_push_es);
             offset++;
             break;
 
         case 0x07:  /* POP ES */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_pop_es);
+            emit_bl(g_helpers.dinstr_pop_es);
             offset++;
             break;
 
@@ -592,29 +1429,33 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x0A:  /* OR Gb,Eb */
         case 0x0B:  /* OR Gv,Ev */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x0C:  /* OR AL,Ib */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_or_al_imm8);
+            emit_bl(g_helpers.dinstr_or_al_imm8);
             offset += 2;
             break;
 
         case 0x0D:  /* OR AX,Iv */
             emit_mov_reg(0, 4);
             emit_movw(1, mem[offset + 1] | (mem[offset + 2] << 8));
-            emit_bl((uint32_t)&dinstr_or_ax_imm16);
+            emit_bl(g_helpers.dinstr_or_ax_imm16);
             offset += 3;
             break;
 
         case 0x0E:  /* PUSH CS */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_push_cs);
+            emit_bl(g_helpers.dinstr_push_cs);
             offset++;
             break;
 
@@ -624,23 +1465,27 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x12:  /* ADC Gb,Eb */
         case 0x13:  /* ADC Gv,Ev */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x14:  /* ADC AL,Ib */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_adc_al_imm8);
+            emit_bl(g_helpers.dinstr_adc_al_imm8);
             offset += 2;
             break;
 
         case 0x15:  /* ADC AX,Iv */
             emit_mov_reg(0, 4);
             emit_movw(1, mem[offset + 1] | (mem[offset + 2] << 8));
-            emit_bl((uint32_t)&dinstr_adc_ax_imm16);
+            emit_bl(g_helpers.dinstr_adc_ax_imm16);
             offset += 3;
             break;
 
@@ -650,47 +1495,51 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x1A:  /* SBB Gb,Eb */
         case 0x1B:  /* SBB Gv,Ev */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x1C:  /* SBB AL,Ib */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_sbb_al_imm8);
+            emit_bl(g_helpers.dinstr_sbb_al_imm8);
             offset += 2;
             break;
 
         case 0x1D:  /* SBB AX,Iv */
             emit_mov_reg(0, 4);
             emit_movw(1, mem[offset + 1] | (mem[offset + 2] << 8));
-            emit_bl((uint32_t)&dinstr_sbb_ax_imm16);
+            emit_bl(g_helpers.dinstr_sbb_ax_imm16);
             offset += 3;
             break;
 
         case 0x16:  /* PUSH SS */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_push_ss);
+            emit_bl(g_helpers.dinstr_push_ss);
             offset++;
             break;
 
         case 0x17:  /* POP SS */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_pop_ss);
+            emit_bl(g_helpers.dinstr_pop_ss);
             offset++;
             break;
 
         case 0x1E:  /* PUSH DS */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_push_ds);
+            emit_bl(g_helpers.dinstr_push_ds);
             offset++;
             break;
 
         case 0x1F:  /* POP DS */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_pop_ds);
+            emit_bl(g_helpers.dinstr_pop_ds);
             offset++;
             break;
 
@@ -700,23 +1549,27 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x32:  /* XOR Gb,Eb */
         case 0x33:  /* XOR Gv,Ev */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x34:  /* XOR AL,Ib */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_xor_al_imm8);
+            emit_bl(g_helpers.dinstr_xor_al_imm8);
             offset += 2;
             break;
 
         case 0x35:  /* XOR AX,Iv */
             emit_mov_reg(0, 4);
             emit_movw(1, mem[offset + 1] | (mem[offset + 2] << 8));
-            emit_bl((uint32_t)&dinstr_xor_ax_imm16);
+            emit_bl(g_helpers.dinstr_xor_ax_imm16);
             offset += 3;
             break;
 
@@ -724,16 +1577,20 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x20: case 0x21: case 0x22: case 0x23:
             /* AND Eb,Gb / AND Ev,Gv / AND Gb,Eb / AND Gv,Ev — ModR/M forms */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x24:  /* AND AL, Ib */
             emit_mov_reg(0, 4);
             emit_mov_imm(1, mem[offset + 1]);
-            emit_bl((uint32_t)&dinstr_and_al_imm8);
+            emit_bl(g_helpers.dinstr_and_al_imm8);
             offset += 2;
             break;
 
@@ -742,21 +1599,36 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
                 uint16_t imm = mem[offset + 1] | (mem[offset + 2] << 8);
                 emit_mov_reg(0, 4);
                 emit_movw(1, imm);
-                emit_bl((uint32_t)&dinstr_and_ax_imm16);
+                emit_bl(g_helpers.dinstr_and_ax_imm16);
             }
+            offset += 3;
+            break;
+
+        /* ---- TEST AL/AX with immediate (0xA8-0xA9) ---- */
+        case 0xA8:  /* TEST AL, Ib */
+            emit_mov_reg(0, 4);
+            emit_mov_imm(1, mem[offset + 1]);
+            emit_bl(g_helpers.dinstr_test_al_imm8);
+            offset += 2;
+            break;
+
+        case 0xA9:  /* TEST AX, Iv */
+            emit_mov_reg(0, 4);
+            emit_movw(1, mem[offset + 1] | (mem[offset + 2] << 8));
+            emit_bl(g_helpers.dinstr_test_ax_imm16);
             offset += 3;
             break;
 
         /* ---- SAHF/LAHF ---- */
         case 0x9E:  /* SAHF */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_sahf);
+            emit_bl(g_helpers.dinstr_sahf);
             offset++;
             break;
 
         case 0x9F:  /* LAHF */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_lahf);
+            emit_bl(g_helpers.dinstr_lahf);
             offset++;
             break;
 
@@ -767,43 +1639,43 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
 
         case 0xF5:  /* CMC */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_cmc);
+            emit_bl(g_helpers.dinstr_cmc);
             offset++;
             break;
 
         case 0xF8:  /* CLC */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_clc);
+            emit_bl(g_helpers.dinstr_clc);
             offset++;
             break;
 
         case 0xF9:  /* STC */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_stc);
+            emit_bl(g_helpers.dinstr_stc);
             offset++;
             break;
 
         case 0xFA:  /* CLI */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_cli);
+            emit_bl(g_helpers.dinstr_cli);
             offset++;
             break;
 
         case 0xFB:  /* STI */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_sti);
+            emit_bl(g_helpers.dinstr_sti);
             offset++;
             break;
 
         case 0xFC:  /* CLD */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_cld);
+            emit_bl(g_helpers.dinstr_cld);
             offset++;
             break;
 
         case 0xFD:  /* STD */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_std);
+            emit_bl(g_helpers.dinstr_std);
             offset++;
             break;
 
@@ -819,9 +1691,13 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0xAE:  /* SCASB */
         case 0xAF:  /* SCASW */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
@@ -838,7 +1714,7 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             emit_mov_reg(0, 4);
             emit_mov_imm(1, opcode);
             emit_mov_imm(2, (uint8_t)rel);
-            emit_bl((uint32_t)&dinstr_jcond_rel8);
+            emit_bl(g_helpers.dinstr_jcond_rel8);
             offset += 2;
             instr_count++;
             goto block_done;
@@ -849,26 +1725,38 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x80: case 0x81: case 0x82: case 0x83:
             /* GRP1 Eb/Ib and Ev/Iv (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) — defer to interpreter */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x84:  /* TEST Gb, Eb */
             /* ModR/M-based — defer to interpreter */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x85:  /* TEST Gv, Ev */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
@@ -880,41 +1768,61 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         case 0x8B:  /* MOV Gv, Ev */
             /* Full ModR/M r/m decode — defer to interpreter */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x8C:  /* MOV Ew, Sw */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x8D:  /* LEA Gv, M */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x8E:  /* MOV Sw, Ew */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
         case 0x8F:  /* POP Ev */
             emit_mov_reg(0, 4);
-            emit_bl((uint32_t)&dinstr_exec_one);
-            has_native_instrs = 0;
-            offset++;
+            emit_bl(g_helpers.dinstr_exec_one);
+            /* Charge the instruction its REAL byte length, not 1:
+             * `offset` becomes block->x86_len, the block's invalidation
+             * footprint and the input to expected_end_ip. See
+             * x86_instr_len() for why 1 was wrong and what it costs. */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
             instr_count++;
             goto block_done;
 
@@ -927,6 +1835,11 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             goto translate_fail;
         }
 
+        /* This instruction ran to completion without touching cpu->ip (no
+         * control flow, no interpreter fallback), so carry its byte length
+         * forward and let the next iteration's flush commit it. */
+        pending_ip += (uint32_t)offset - prev_offset;
+
         instr_count++;
     }
 
@@ -936,25 +1849,40 @@ block_done:
         goto translate_fail;
     }
 
+    /* Commit any IP advance still owed. Reached with pending_ip == 0 when
+     * we got here via `goto block_done` (the terminator helper already set
+     * cpu->ip itself); non-zero when the loop simply ran out of
+     * instructions, in which case the last few need their bytes committed. */
+    emit_advance_ip(pending_ip);
+    pending_ip = 0;
+    if (emit32_failed) {
+        goto translate_fail;
+    }
+
     /* Function epilogue */
     ARM_POP();  /* restore r4, r10, r11, pc */
 
-    /* Store in block cache — but only if the block contains natively-translated
-       instructions (not just interpreter fallbacks), since caching pure
-       interpreter fallback blocks wastes cache entries. */
-    if (has_native_instrs && block_cache_count < MAX_BLOCKS) {
-        block_cache[block_cache_count].x86_pc = x86_pc;
-        block_cache[block_cache_count].arm_offset = start_pos;
-        block_cache[block_cache_count].code_len = code_cache_pos - start_pos;
-        block_cache[block_cache_count].x86_len = offset;
-        block_cache[block_cache_count].x86_end_ip = (uint16_t)(cpu->ip + offset);
-        block_cache_count++;
-    } else if (!has_native_instrs) {
-        /* Block only contained interpreter fallbacks — return 0 so dynrec_exec
-           falls back to interpreter directly (don't cache, don't execute). */
-        code_cache_pos = start_pos;  /* discard emitted ARM code */
-        return 0;
-    }
+/* Store in block cache, reusing a slot invalidated since the last flush */
+    {
+        block_entry_t* slot = alloc_block_slot();
+        if (slot) {
+            slot->x86_pc = x86_pc;
+            slot->arm_offset = start_pos;
+            slot->code_len = code_cache_pos - start_pos;
+            slot->x86_len = offset;   /* BYTES of guest x86 code (true length) */
+            slot->instr_count = (uint32_t)instr_count;  /* x86 INSTRUCTIONS */
+            slot->x86_end_ip = (uint16_t)(cpu->ip + offset);
+            slot->valid = 1;
+         }
+     }
+
+    /* Flush the I-cache for this block's generated code. This is done ONCE,
+     * at translation time, NOT on every execution (see the comment at the
+     * execution site in dynrec_exec()). On ARMv5TE, cacheflush() is a
+     * syscall; calling it per-block-execution was the dominant perf bug. */
+    cacheflush((long)(code_cache_base + start_pos),
+                (long)(code_cache_pos),
+                0x3);
 
     return instr_count;
 
@@ -966,25 +1894,26 @@ translate_fail:
 
 void dynrec_init(void) {
     /* Start with dynrec disabled - must be explicitly enabled */
-    code_cache_pos = 0;
-    block_cache_count = 0;
-    memset(block_cache, 0, sizeof(block_cache));
+    flush_all_blocks();
     dynrec_enabled = 0;
     DLOGI("dynrec: initialized (disabled by default - enable via setspeed or nativeRun)");
 }
 
 void dynrec_reset(void) {
     if (!dynrec_enabled) return;
-    if (code_cache_base) {
-        code_cache_pos = 0;
-    }
-    block_cache_count = 0;
-    memset(block_cache, 0, sizeof(block_cache));
+    flush_all_blocks();
     DLOGI("dynrec: reset");
 }
 
 void dynrec_enable(void) {
     if (dynrec_enabled) return;
+
+    /* Resolve all helper function addresses NOW — after the shared library
+     * has been loaded at its runtime base. Under -fPIC, compile-time addresses
+     * are link-time virtual addresses that do not match the relocates runtime
+     * addresses; taking them here captures the correct values for emit_bl(). */
+    dynrec_resolve_helpers();
+
     if (code_cache_base == NULL) {
         code_cache_base = mmap(NULL, CODE_CACHE_SIZE,
                                PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -995,10 +1924,9 @@ void dynrec_enable(void) {
             return;
         }
     }
-    code_cache_pos = 0;
-    block_cache_count = 0;
-    memset(block_cache, 0, sizeof(block_cache));
+    flush_all_blocks();
     dynrec_enabled = 1;
+    crashlog("ENABLE: code_cache_base=%p", code_cache_base);
     DLOGI("dynrec: enabled, code_cache_base=%p", code_cache_base);
 }
 
@@ -1010,10 +1938,35 @@ void dynrec_disable(void) {
 void dynrec_invalidate_range(uint32_t start, uint32_t len) {
     if (!dynrec_enabled) return;
     uint32_t end = start + len;
+    /*
+	Interval intersection, not a start-address test. cpu_write() calls this
+	with len==1 for every byte written to RAM, so testing only
+	block.x86_pc == start meant a patch landing anywhere inside a
+	translated block left the stale block in the cache to be executed
+	again. A write at the very first byte of a block is rare; writes into
+	the interior are what actually happen (code loads, patches, SMC).
+    */
     for (int i = 0; i < block_cache_count; i++) {
-        uint32_t block_end = block_cache[i].x86_pc + block_cache[i].x86_len;
-        if (block_cache[i].x86_pc >= start && block_cache[i].x86_pc < end) {
-            block_cache[i].x86_pc = 0;
+        uint32_t block_end;
+        if (!block_cache[i].valid) continue;
+        /*
+         * The footprint is [x86_pc, x86_pc + x86_len) and x86_len is the TRUE
+         * byte length of the block's x86 code, so a write to any byte of any
+         * instruction in the block -- including the ModR/M, SIB, displacement
+         * and immediate bytes of an instruction the block handed to the
+         * interpreter -- lands inside it. Charging those instructions 1 byte
+         * each (the old behaviour) left their remaining bytes outside the
+         * range, and a patch there failed to invalidate the block. See
+         * x86_instr_len() for how the length is obtained and why it never
+         * under-estimates.
+         */
+        block_end = block_cache[i].x86_pc + block_cache[i].x86_len;
+        if (block_cache[i].x86_pc < end && block_end > start) {
+            DLOGI("invalidate: block at 0x%05X len=%u (instrs=%u) overlaps "
+                  "write 0x%05X..0x%05X",
+                  block_cache[i].x86_pc, block_cache[i].x86_len,
+                  block_cache[i].instr_count, start, end);
+            block_cache[i].valid = 0;
         }
     }
 }
@@ -1038,30 +1991,47 @@ int dynrec_exec(CPU_t* cpu, I8259_t* i8259, int max_instr) {
             continue;
         }
 
-        uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
-        block_entry_t* block = find_block(x86_pc);
+    uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
+    block_entry_t* block = find_block(x86_pc);
 
-    if (block == NULL || block->x86_pc == 0) {
+     if (block != NULL) {
+     } else {
         int result = translate_block(cpu, x86_pc, MAX_INSTRUCTIONS);
         if (result < 0 || result == 0) {
             /* Can't translate or empty block — use interpreter */
-            int batch = (max_instr - total_executed);
-            if (batch > 1000) batch = 1000;
-            cpu_exec(cpu, batch);
+             int batch = (max_instr - total_executed);
+             if (batch > 1000) batch = 1000;
+             cpu_exec(cpu, batch);
             dynrec_interpreter_instrs += batch;
             total_executed += batch;
             continue;
         }
-        block = &block_cache[block_cache_count - 1];
+        /*
+            Look the block back up rather than assuming it landed in the
+            last slot: alloc_block_slot() reuses a freed slot wherever it
+            finds one, so the entry can be anywhere in the array.
+        */
+        block = find_block(x86_pc);
+         if (block == NULL) {
+             /* Translation reported success but left nothing cached — treat
+              * it as untranslatable rather than executing a garbage block. */
+             cpu_exec(cpu, 1);
+            dynrec_interpreter_instrs += 1;
+            total_executed += 1;
+            continue;
+        }
     }
 
-    /* Flush data cache and invalidate instruction cache to ensure
-     * generated code is visible to the CPU. On ARMv5TE with Android,
-     * __builtin___clear_cache may not work reliably — use the
-     * cacheflush() syscall wrapper which issues the SWI directly. */
-    cacheflush((long)(code_cache_base + block->arm_offset),
-               (long)(code_cache_base + block->arm_offset + block->code_len),
-               0);
+    /* Execute the translated block.
+     *
+     * NOTE: cacheflush() is NOT called here — it is unnecessary to flush on
+     * every block execution. The block's code was flushed once at translation
+     * time (in translate_block(), after the instructions were emitted). On
+     * ARMv5TE, cacheflush() is a SWI→kernel syscall costing ~1-2µs. Calling
+     * it per-block (instead of per-translation) was the dominant performance
+     * bottleneck: with single-instruction blocks and 1000-instruction batches,
+     * that meant ~1000 syscalls per batch, starving the 8088 core on the
+     * 528MHz single-core IS01. */
 
     /* Execute the translated block */
     typedef void (*block_func_t)(CPU_t* cpu);
@@ -1070,23 +2040,58 @@ int dynrec_exec(CPU_t* cpu, I8259_t* i8259, int max_instr) {
     uint16_t ip_before = cpu->ip;
     uint16_t expected_end_ip = (uint16_t)(cpu->ip + block->x86_len);
 
+    /* Crash attribution globals only — no logging on the hot path. */
+    g_cur_arm_off = block->arm_offset;
+    g_cur_code_len = block->code_len;
+    g_cur_x86_pc = x86_pc;
+    g_cur_cpu = (uint32_t)(uintptr_t)cpu;
+    /* NOT the block's R4 — the C caller's R4. Only used for the after-call
+     * epilogue comparison below. */
+    g_cur_r4_in = dynrec_read_r4();
+
+    g_active_blocks++;
     func(cpu);
+    g_active_blocks--;
+
+    /* A caller_r4 != exit_r4 mismatch means the block's epilogue
+     * `pop {r4,...}` failed to restore R4. */
+    if (g_cur_r4_in != dynrec_read_r4()) {
+        crashlog("R4_CORRUPT: x86_pc=0x%05X caller_r4=0x%08X exit_r4=0x%08X",
+                 x86_pc, (unsigned)g_cur_r4_in, (unsigned)dynrec_read_r4());
+    }
+
+    g_cur_arm_off = 0xFFFFFFFFu;
+    g_cur_code_len = 0;
+    g_cur_x86_pc = 0;
+    g_cur_cpu = 0;
+    g_cur_r4_in = 0;
+
     dynrec_native_blocks++;
 
-    if (cpu->ip == ip_before) {
+    /* The generated code advances cpu->ip itself (see emit_advance_ip), so
+     * after a block that had no terminator cpu->ip should already equal
+     * expected_end_ip. A block ending in jmp/call/ret/int legitimately
+     * leaves it elsewhere, so only the unchanged case is suspicious. */
+    if (cpu->ip == ip_before && block->x86_len > 0) {
+        crashlog("IP_DESYNC: x86_pc=0x%05X ip unchanged at 0x%04X, expected 0x%04X",
+                 x86_pc, ip_before, expected_end_ip);
         cpu->ip = expected_end_ip;
     }
 
-    if (cpu->ip == ip_before) {
-        cpu->ip = expected_end_ip;
-    }
-
+    /* Removed duplicate redundant check — this was a copy-paste error */
     if (cpu->hltstate || cpu->trap_toggle) {
-        total_executed += block->x86_len;
+        total_executed += block->instr_count;
         continue;
     }
 
-    total_executed += block->x86_len;
+    /*
+     * Count INSTRUCTIONS executed, not bytes. x86_len is a byte count and the
+     * two only coincide for blocks of 1-byte instructions: a block holding one
+     * 4-byte JZ would have charged 4, and a block holding a block of MOV AX
+     * (3 bytes each) 15 for 5 instructions. dynrec_exec()'s return value is a
+     * budget against max_instr, so it has to be counted in instructions.
+     */
+    total_executed += block->instr_count;
     }
 
     return total_executed > 0 ? total_executed : max_instr;
@@ -1112,6 +2117,20 @@ int dynrec_exec(CPU_t* cpu, I8259_t* i8259, int max_instr) {
 }
 void dynrec_invalidate_range(uint32_t start, uint32_t len) {
     (void)start; (void)len;
+}
+int dynrec_get_code_cache(uintptr_t *base, uint32_t *size) {
+    if (base) *base = 0;
+    if (size) *size = 0;
+    return 0;
+}
+int dynrec_get_current_block(uint32_t *arm_off, uint32_t *code_len, uint32_t *x86_pc) {
+    (void)arm_off; (void)code_len; (void)x86_pc;
+    return 0;
+}
+int dynrec_get_current_entry(uint32_t *entry_cpu, uint32_t *caller_r4) {
+    if (entry_cpu) *entry_cpu = 0;
+    if (caller_r4) *caller_r4 = 0;
+    return 0;
 }
 
 #endif

@@ -19,6 +19,7 @@ public final class R {
         public static final int menu_reset=0x7f060001;
         public static final int menu_showspeed=0x7f060003;
         public static final int menu_trace_cpu=0x7f060004;
+        public static final int menu_trace_diag=0x7f060009;
         public static final int menu_trace_disk=0x7f060007;
         public static final int menu_trace_interrupts=0x7f060006;
         public static final int menu_trace_keyboard=0x7f060005;

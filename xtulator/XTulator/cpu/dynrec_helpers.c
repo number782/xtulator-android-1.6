@@ -34,9 +34,29 @@ int dinstr_hlt(CPU_t* cpu) {
     return 0;
 }
 
+/* Advance cpu->ip by n bytes.
+ *
+ * The interpreter in cpu_exec() steps the IP inside its dispatch loop
+ * (StepIP), so every native helper below can ignore it. The dynarec has
+ * no such loop: the generated ARM block just calls helpers back to back,
+ * so the IP has to be advanced explicitly. Without this, cpu->ip is still
+ * pointing at the FIRST instruction of the block when a later helper runs
+ * — which makes dinstr_exec_one() re-execute that first instruction and
+ * every helper that reads ip (call/ret/jmp/int) compute from the wrong
+ * address.
+ *
+ * The translator emits one call to this per translated instruction, and
+ * always *before* any helper that consumes ip (exec_one, jmp, call, ret,
+ * int), so those helpers observe a correct IP.
+ */
+int dinstr_advance_ip(CPU_t* cpu, uint16_t n) {
+    cpu->ip = (uint16_t)(cpu->ip + n);
+    return 0;
+}
+
 /* Execute one instruction via the interpreter — used for opcodes not
-   natively translated by the dynrec (ModR/M instructions, etc.)
-   Returns the number of bytes the instruction consumed (1-3). */
+ * natively translated by the dynrec (ModR/M instructions, etc.)
+ * Returns the number of bytes the instruction consumed (1-3). */
 int dinstr_exec_one(CPU_t* cpu) {
     uint16_t ip_before = cpu->ip;
     cpu_exec(cpu, 1);
@@ -93,6 +113,12 @@ int dinstr_pop_r16(CPU_t* cpu, uint8_t regnum) {
 
 int dinstr_mov_r_i(CPU_t* cpu, uint8_t regnum, uint16_t imm) {
     cpu->regs.wordregs[regnum] = imm;
+    return 0;
+}
+
+/* 0xB0-0xB7: MOV r8, Ib — opcode encodes register as: 0=AL,1=CL,2=DL,3=BL,4=AH,5=CH,6=DH,7=BH */
+int dinstr_mov_r8_imm8(CPU_t* cpu, uint8_t regnum, uint8_t imm) {
+    cpu->regs.byteregs[byteregtable[regnum]] = imm;
     return 0;
 }
 
@@ -155,6 +181,36 @@ int dinstr_ret_near(CPU_t* cpu) {
     cpu->regs.wordregs[regsp] += 2;
     /* RET terminates the basic block */
     return 1;
+}
+
+/* ---- LOOP/LOOPE/LOOPNE/JCXZ (0xE0-0xE3) ---- */
+
+/* 0xE0: LOOPNE/JCXZ-with-conditions — loop if CX!=0 and ZF==0 */
+/* 0xE1: LOOPE/LOOPZ — loop if CX!=0 and ZF==1 */
+/* 0xE2: LOOP — loop if CX!=0 */
+/* 0xE3: JCXZ — jump if CX==0 */
+/* opcode: 0xE0 (LOOPNZ), 0xE1 (LOOPZ), 0xE2 (LOOP), 0xE3 (JCXZ)
+ * rel: signed 8-bit displacement */
+int dinstr_loop_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel) {
+    cpu->ip += 2;  /* advance past opcode + rel8 */
+    cpu->regs.wordregs[regcx] = (uint16_t)(cpu->regs.wordregs[regcx] - 1);
+    switch (opcode) {
+    case 0xE0:  /* LOOPNE: CX!=0 && ZF==0 */
+        if (cpu->regs.wordregs[regcx] && !cpu->zf) cpu->ip += rel;
+        break;
+    case 0xE1:  /* LOOPZ: CX!=0 && ZF==1 */
+        if (cpu->regs.wordregs[regcx] && cpu->zf) cpu->ip += rel;
+        break;
+    case 0xE2:  /* LOOP: CX!=0 */
+        if (cpu->regs.wordregs[regcx]) cpu->ip += rel;
+        break;
+    case 0xE3:  /* JCXZ: CX==0 (CX NOT decremented for JCXZ) */
+        /* JCXZ doesn't decrement CX; undo the decrement above */
+        cpu->regs.wordregs[regcx] = (uint16_t)(cpu->regs.wordregs[regcx] + 1);
+        if (cpu->regs.wordregs[regcx] == 0) cpu->ip += rel;
+        break;
+    }
+    return 1;  /* loop/control-flow terminates the basic block */
 }
 
 int dinstr_int(CPU_t* cpu, uint8_t intnum) {
@@ -749,5 +805,29 @@ int dinstr_and_ax_imm16(CPU_t* cpu, uint16_t imm) {
     cpu->cf = 0;
     cpu->of = 0;
     cpu->regs.wordregs[regax] = res;
+    return 0;
+}
+
+/* 0xA8: TEST AL, Ib — AND AL with immediate8, set flags, discard result */
+int dinstr_test_al_imm8(CPU_t* cpu, uint8_t imm) {
+    uint8_t res = cpu->regs.byteregs[regal] & imm;
+    if (!res) cpu->zf = 1; else cpu->zf = 0;
+    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
+    cpu->pf = calc_parity(res);
+    cpu->cf = 0;
+    cpu->of = 0;
+    /* TEST discards result — don't write back */
+    return 0;
+}
+
+/* 0xA9: TEST AX, Iv — AND AX with immediate16, set flags, discard result */
+int dinstr_test_ax_imm16(CPU_t* cpu, uint16_t imm) {
+    uint16_t res = cpu->regs.wordregs[regax] & imm;
+    if (!res) cpu->zf = 1; else cpu->zf = 0;
+    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+    cpu->pf = calc_parity(res & 0xFF);
+    cpu->cf = 0;
+    cpu->of = 0;
+    /* TEST discards result — don't write back */
     return 0;
 }
