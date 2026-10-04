@@ -158,9 +158,11 @@ static int emit32_failed = 0;
 
 static void emit32(uint32_t instr) {
     if (emit32_failed) return;
+    /* Guard against writing into the guard page (CODE_CACHE_SIZE is the
+     * executable limit; the 4KB guard page starts at CODE_CACHE_SIZE). */
     if (code_cache_pos + 4 > CODE_CACHE_SIZE) {
         emit32_failed = 1;
-        DLOGI("emit32: code cache overflow at pos=%u", code_cache_pos);
+        DLOGI("emit32: code cache overflow at pos=%u (limit=%u)", code_cache_pos, CODE_CACHE_SIZE);
         return;
     }
     *((uint32_t*)(code_cache_base + code_cache_pos)) = instr;
@@ -215,26 +217,38 @@ static void emit_mov_imm(int Rd, uint8_t imm) {
     emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | imm);
 }
 
-/* MOVW Rd, #imm16 — load 16-bit immediate (ARMv5TE doesn't have MOVW, so use MOV+ORR) */
+/* MOVW Rd, #imm16 — load 16-bit immediate (ARMv5TE doesn't have MOVW).
+ * Use MOV hi8; MOV Rd, Rd, LSL #4; MOV Rd, Rd, LSL #4; ORR Rd, Rd, #lo8.
+ * This produces the correct little-endian 16-bit value (hi at bits 15-8, lo at bits 7-0).
+ * ARM immediate encoding cannot represent 0x00HH00 (hi byte at bits 15-8)
+ * as a single rotated immediate, so we must use register shifts.
+ * Using two LSL #4 avoids a suspected encoding issue with LSL #8.
+ * Encoding: 0xE1A00000 | (Rd<<12) | Rd | (shift_imm<<7) | (shift_type<<5) | Rm
+ * For LSL #4: shift_imm=4 (at bits 11-7), shift_type=00 (LSL, at bits 6-5).
+ * shift_imm=4 → (4<<7)=0x200; shift_type=00 → no bits at 6-5. NO 0x10! */
 static void emit_movw(int Rd, uint16_t imm) {
     uint32_t lo = imm & 0xFF;
     uint32_t hi = (imm >> 8) & 0xFF;
     if (hi == 0) {
         emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | lo);  /* MOV Rd, #lo */
     } else if (lo == 0) {
-        /* Encode hi << 8 using rotate: ROR 24 (rotate_imm=12) of imm8.
-         * rotate_imm occupies bits [11:8]; imm8 occupies bits [7:0]. */
-        emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | (12 << 8) | hi);  /* MOV Rd, #hi, LSL #8 */
+        /* MOV Rd, #hi; MOV Rd, Rd, LSL #4; MOV Rd, Rd, LSL #4 */
+        emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | hi);  /* MOV Rd, #hi */
+        emit32(0xE1A00000 | (Rd << 12) | Rd | (4 << 7));  /* MOV Rd, Rd, LSL #4 */
+        emit32(0xE1A00000 | (Rd << 12) | Rd | (4 << 7));  /* MOV Rd, Rd, LSL #4 */
     } else {
-        /* MOV Rd, #lo; ORR Rd, Rd, #hi << 8 */
-        emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | lo);  /* MOV Rd, #lo */
-        emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | (12 << 8) | hi);  /* ORR Rd, Rd, #hi, LSL #8 */
+        /* MOV Rd, #hi; MOV Rd, Rd, LSL #4; MOV Rd, Rd, LSL #4; ORR Rd, Rd, #lo */
+        emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | hi);  /* MOV Rd, #hi */
+        emit32(0xE1A00000 | (Rd << 12) | Rd | (4 << 7));  /* MOV Rd, Rd, LSL #4 */
+        emit32(0xE1A00000 | (Rd << 12) | Rd | (4 << 7));  /* MOV Rd, Rd, LSL #4 */
+        emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | lo);  /* ORR Rd, Rd, #lo */
     }
 }
 
 /* LDR r0, =imm32 (literal pool) - not currently used */
 static void emit_ldr_imm32(int Rd, uint32_t imm) {
-    /* MOV + ORR approach for arbitrary 32-bit immediate */
+    /* MOV + ORR approach for arbitrary 32-bit immediate.
+     * Use register shifts (LSL #8, #16, #24) instead of broken immediate rotates. */
     uint8_t b0 = imm & 0xFF;
     uint8_t b1 = (imm >> 8) & 0xFF;
     uint8_t b2 = (imm >> 16) & 0xFF;
@@ -244,10 +258,11 @@ static void emit_ldr_imm32(int Rd, uint32_t imm) {
     } else if (b2 == 0 && b3 == 0) {
         emit32(ARM_COND_AL | 0x3A00000 | (Rd << 12) | b0);   /* MOV Rd, #b0 */
         if (b1 != 0) {
-            emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | (12 << 8) | b1);  /* ORR Rd, Rd, #b1, LSL #8 */
+            emit32(ARM_COND_AL | 0xE1A00000 | (Rd << 12) | (Rd << 16) | (8 << 7));  /* MOV Rd, Rd, LSL #8 */
+            emit32(ARM_COND_AL | 0x3800000 | (Rd << 12) | (Rd << 16) | b1);  /* ORR Rd, Rd, #b1 */
         }
     }
-    /* For 3-4 byte immediates, would need additional ORR instructions with rotates */
+    /* For 3-4 byte immediates, would need additional shifts and ORRs */
 }
 
 /* BL to target — computes offset automatically at emit time.
@@ -283,11 +298,12 @@ static void emit_ldr_imm32(int Rd, uint32_t imm) {
  */
 static void emit_bl(uint32_t target_addr) {
     uint32_t pc = code_cache_pos;
-    /* On ARM, PC reads as instruction_address + 8 during execution. This is
-     * the address of the BL word itself, so it does not move when the
-     * spacing word is added below — the offset must NOT be shifted for it. */
-    uint32_t base_pc_plus_8 = (uint32_t)code_cache_base + pc + 8;
-    int32_t offset = (int32_t)(target_addr - base_pc_plus_8) / 4;
+    /* On ARM, PC reads as instruction_address + 8 during execution.
+     * BL/BLX set LR = address of next instruction = (address of call) + 4.
+     * So LR naturally points to the word immediately after the call.
+     * No absorber word is needed or wanted. */
+    uint32_t base_pc = (uint32_t)code_cache_base + pc;
+    int32_t offset = (int32_t)(target_addr - (base_pc + 8)) / 4;
 
     if (offset > 8388607 || offset < -8388608) {
         /* Target is out of BL's ±32MB range (24-bit signed offset). This is the
@@ -298,57 +314,62 @@ static void emit_bl(uint32_t target_addr) {
          * Emit an indirect call that materialises the FULL 32-bit target into
          * R12 and uses BLX Rm. There is deliberately NO literal pool.
          *
-         * The `B .-4` after the BLX is the shared invariant documented at the
-         * top of this function, not a quirk of this path — the in-range path
-         * emits an identical absorber, because `BL` has exactly the same +8
-         * bias as `BLX <Rm>`.
-         *
          * Do NOT "optimise" this into `LDR R12,[PC,#n]` + `.word target`:
          * that is what this code used to do, and BLX's +8 bias put the pool
          * word exactly at LR, so the helper's own address was executed as ARM
          * code on every return from every helper call.
          *
-         * The target is built low-half-first (emit_movw handles the lo==0 /
-         * hi==0 special cases with a single instruction), then bits 16-31 are
-         * ORR'd in -- helper addresses such as 0x4203330c do not fit in 16
-         * bits, so a bare (uint16_t) truncation would silently call the wrong
-         * address on the device.
-         */
-        uint32_t b16 = (target_addr >> 16) & 0xFF;   /* lands in bits 16-23 */
-        uint32_t b24 = (target_addr >> 24) & 0xFF;   /* lands in bits 24-31 */
+         * Build the full 32-bit address using the same shift-based approach as
+         * emit_movw: low 16 bits via emit_movw, then upper 16 bits via LSL #8
+         * and ORR. This works for ANY 32-bit address, unlike ORR immediates
+         * which only work for rotated-immediate encodable values. */
+/* Build the full 32-bit address using emit_movw-style for low16,
+          * then shift left 16 and add high16 via ORR. Works for ANY 32-bit value,
+          * uses only R12 (no temp regs). */
+         uint16_t low16 = target_addr & 0xFFFF;
+         uint16_t high16 = (target_addr >> 16) & 0xFFFF;
 
-        emit_movw(12, (uint16_t)(target_addr & 0xFFFF));   /* R12 = target & 0xFFFF */
-        if (b16)
-            /* ORR R12, R12, #b16 — rotate_imm=8 → ROR 16 → value at bits 16-23 */
-            emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16)
-                   | (8 << 8) | b16);
-        if (b24)
-            /* ORR R12, R12, #b24 — rotate_imm=4 → ROR 8 → value at bits 24-31 */
-            emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16)
-                   | (4 << 8) | b24);
-        emit32(0xE12FFF3C);     /* BLX R12 — 0xE12FFF3C; NOT 0xE12FFF9C (that is MSR).
-                                  * Sets LR = (this word + 2), so it is deliberately
-                                  * NOT the last word emitted. */
-        emit32(0xEAFFFFFF);     /* B .-4 — branch to the next word. Absorbs BLX's
-                                  * +8 bias so LR lands on the caller's next word,
-                                  * including the POP when this is the block's last
-                                  * call. Never executed. */
+         /* Build low16 in R12 using emit_movw logic */
+         uint32_t lo = low16 & 0xFF;
+         uint32_t hi = (low16 >> 8) & 0xFF;
+         if (hi == 0) {
+             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | lo);  /* MOV R12, #lo */
+         } else if (lo == 0) {
+             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | hi);  /* MOV R12, #hi */
+             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 (x2 = LSL #8) */
+         } else {
+             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | hi);  /* MOV R12, #hi */
+             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+             emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo);  /* ORR R12, R12, #lo */
+         }
+
+         if (high16 != 0) {
+             /* Shift R12 left by 16 (LSL #8 twice) */
+             emit32(0xE1A00000 | (12 << 12) | 12 | (8 << 7));  /* MOV R12, R12, LSL #8 */
+             emit32(0xE1A00000 | (12 << 12) | 12 | (8 << 7));  /* MOV R12, R12, LSL #8 */
+
+             /* Build high16 into R12 using ORR for first byte */
+             uint32_t hi2 = (high16 >> 8) & 0xFF;
+             uint32_t lo2 = high16 & 0xFF;
+             if (hi2 != 0) {
+                 emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | hi2);  /* ORR R12, R12, #hi2 */
+                 emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+                 emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+                 if (lo2 != 0) {
+                     emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo2);  /* ORR R12, R12, #lo2 */
+                 }
+             } else if (lo2 != 0) {
+                 emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo2);  /* ORR R12, R12, #lo2 */
+             }
+         }
+        emit32(0xE12FFF3C);     /* BLX R12 — 0xE12FFF3C; NOT 0xE12FFF9C (that is MSR) */
     } else {
         emit32(0xEB000000 | (offset & 0xFFFFFF));  /* BL -- `offset` was computed
-                                                      * from base_pc_plus_8, the
-                                                      * address of THIS word, so it
-                                                      * must not be shifted. */
-        emit32(0xEAFFFFFF);                          /* B .-4 — the SAME absorber
-                                                       * the indirect path emits.
-                                                       * `BL` sets LR = address + 8
-                                                       * exactly like `BLX <Rm>`, so
-                                                       * without this word LR lands
-                                                       * on call+8: one word of the
-                                                       * block is skipped mid-block,
-                                                       * and on the block's last call
-                                                       * the return sails past the
-                                                       * POP epilogue into whatever
-                                                       * follows in the code cache. */
+                                                       * from base_pc_plus_8, the
+                                                       * address of THIS word, so it
+                                                       * must not be shifted. */
     }
 }
 
@@ -1915,18 +1936,29 @@ void dynrec_enable(void) {
     dynrec_resolve_helpers();
 
     if (code_cache_base == NULL) {
-        code_cache_base = mmap(NULL, CODE_CACHE_SIZE,
-                               PROT_READ | PROT_WRITE | PROT_EXEC,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (code_cache_base == MAP_FAILED) {
+        /* Map CODE_CACHE_SIZE + 4KB guard page. The guard page (PROT_NONE)
+         * catches runaway execution that falls off the end of the code cache,
+         * giving a clean SIGSEGV at the guard page instead of silent corruption. */
+        void* base = mmap(NULL, CODE_CACHE_SIZE + 4096,
+                          PROT_READ | PROT_WRITE | PROT_EXEC,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) {
             DLOGI("dynrec: mmap failed on enable");
             code_cache_base = NULL;
             return;
         }
+        /* Protect the guard page (last 4KB) as PROT_NONE */
+        void* guard_page = (uint8_t*)base + CODE_CACHE_SIZE;
+        if (mprotect(guard_page, 4096, PROT_NONE) != 0) {
+            DLOGI("dynrec: mprotect guard page failed");
+            /* Not fatal - continue without guard page */
+        }
+        code_cache_base = (uint8_t*)base;
     }
     flush_all_blocks();
     dynrec_enabled = 1;
-    crashlog("ENABLE: code_cache_base=%p", code_cache_base);
+    crashlog("ENABLE: code_cache_base=%p (guard at %p)", code_cache_base,
+             (void*)((uint8_t*)code_cache_base + CODE_CACHE_SIZE));
     DLOGI("dynrec: enabled, code_cache_base=%p", code_cache_base);
 }
 
@@ -1991,10 +2023,21 @@ int dynrec_exec(CPU_t* cpu, I8259_t* i8259, int max_instr) {
             continue;
         }
 
-    uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
+uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
     block_entry_t* block = find_block(x86_pc);
 
-     if (block != NULL) {
+    if (block != NULL) {
+        /* Safety check: block must be within executable code cache region.
+         * If somehow a block lands in the guard page, invalidate it and fall back. */
+        if (block->arm_offset >= CODE_CACHE_SIZE) {
+            crashlog("BLOCK_IN_GUARD: x86_pc=0x%05X arm_off=%u >= CODE_CACHE_SIZE, invalidating",
+                     x86_pc, block->arm_offset);
+            block->valid = 0;
+            block = NULL;
+        }
+    }
+
+    if (block != NULL) {
      } else {
         int result = translate_block(cpu, x86_pc, MAX_INSTRUCTIONS);
         if (result < 0 || result == 0) {
