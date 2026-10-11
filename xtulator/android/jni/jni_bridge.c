@@ -568,6 +568,9 @@ JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeInit(JNI
 	LOGI("nativeInit: machine_init OK");
 
     /* Initialize dynamic recompiler */
+#ifdef DR_CHURN_PROBE
+	{ extern CPU_t* dr_probe_cpu; dr_probe_cpu = &machine.CPU; }
+#endif
     dynrec_init();
     /* Dynrec disabled by default — enable via menu toggle */
     if (dynrec_enabled) {

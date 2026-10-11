@@ -10,6 +10,10 @@
    is direct-mapped RAM (not MMIO) before translating a block. */
 extern uint8_t* memory_mapRead[];
 extern uint8_t* memory_mapWrite[];
+/* 4 KB page tables (see memory.c): non-NULL = whole page is plain RAM. */
+#define MEMORY_PAGE_SHIFT 12
+extern uint8_t* memory_pgRead[];
+extern uint8_t* memory_pgWrite[];
 extern uint8_t (*memory_mapReadCallback[])(void* udata, uint32_t addr);
 extern void (*memory_mapWriteCallback[])(void* udata, uint32_t addr, uint8_t value);
 

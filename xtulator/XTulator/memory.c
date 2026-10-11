@@ -52,8 +52,8 @@ void* memory_udata[MEMORY_RANGE];
 #define MEM_PAGE_SHIFT	12
 #define MEM_PAGE_SIZE	(1u << MEM_PAGE_SHIFT)
 #define MEM_PAGES		(MEMORY_RANGE >> MEM_PAGE_SHIFT)
-static uint8_t* memory_pgRead[MEM_PAGES];
-static uint8_t* memory_pgWrite[MEM_PAGES];
+uint8_t* memory_pgRead[MEM_PAGES];     /* exported: cpu.c word accessors use them */
+uint8_t* memory_pgWrite[MEM_PAGES];
 
 static void memory_rebuildPages(uint32_t start, uint32_t len) {
 	uint32_t p, first, last, i;

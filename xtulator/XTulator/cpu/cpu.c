@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cpu.h"
+#include "../memory.h"
+#include "dynrec.h"
 #include "../config.h"
 #include "../debuglog.h"
 #include "../diag.h"
@@ -45,12 +47,35 @@ const uint8_t parity[0x100] = {
 	0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1
 };
 
+/* A word that does not cross a 4 KB page, in plain RAM, is one page lookup
+ * and two direct byte accesses instead of two full cpu_read/cpu_write calls.
+ * A word straddling the page edge, or any non-RAM page, takes the old path, so
+ * behaviour (including per-byte dynrec invalidation) is unchanged. */
 FUNC_INLINE void cpu_writew(CPU_t* cpu, uint32_t addr32, uint16_t value) {
+	uint32_t a = addr32 & MEMORY_MASK;
+	uint32_t off = a & 0xFFF;
+	if (off != 0xFFF) {
+		uint8_t* p = memory_pgWrite[a >> MEMORY_PAGE_SHIFT];
+		if (p != NULL) {
+			p[off] = (uint8_t)value;
+			p[off + 1] = (uint8_t)(value >> 8);
+			if (dynrec_enabled) dynrec_invalidate_range(a, 2);
+			return;
+		}
+	}
 	cpu_write(cpu, addr32, (uint8_t)value);
 	cpu_write(cpu, addr32 + 1, (uint8_t)(value >> 8));
 }
 
 FUNC_INLINE uint16_t cpu_readw(CPU_t* cpu, uint32_t addr32) {
+	uint32_t a = addr32 & MEMORY_MASK;
+	uint32_t off = a & 0xFFF;
+	if (off != 0xFFF) {
+		uint8_t* p = memory_pgRead[a >> MEMORY_PAGE_SHIFT];
+		if (p != NULL) {
+			return (uint16_t)(p[off] | ((uint16_t)p[off + 1] << 8));
+		}
+	}
 	return ((uint16_t)cpu_read(cpu, addr32) | (uint16_t)(cpu_read(cpu, addr32 + 1) << 8));
 }
 

@@ -31,6 +31,34 @@
 #include "../chipset/i8259.h"
 #include "../memory.h"
 #include "../debuglog.h"
+/* CHURN PROBE: traces block translations/kills for a guest address range.
+ * Enable with -DDR_CHURN_PROBE (device: logcat tag XT-CHURN) or HOSTTEST
+ * (host: stderr). Off in normal builds. */
+#if defined(HOSTTEST) || defined(DR_CHURN_PROBE)
+#define DR_PROBE_ON 1
+#include <stdio.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+CPU_t* dr_probe_cpu;
+static uint32_t dr_probe_wr, dr_probe_wlen, dr_probe_inval;
+static int dr_probe_n;
+#ifndef DR_WATCH_LO
+#define DR_WATCH_LO 0x0660Du
+#endif
+#ifndef DR_WATCH_HI
+#define DR_WATCH_HI 0x06629u
+#endif
+#define DR_OVERLAP(a,l) ((a) <= DR_WATCH_HI && (uint32_t)(a)+(l) > DR_WATCH_LO)
+#ifdef __ANDROID__
+#define DR_PROBE(...) do { if (dr_probe_n++ < 50000000) __android_log_print(ANDROID_LOG_WARN, "XT-CHURN", __VA_ARGS__); } while (0)
+#else
+#define DR_PROBE(...) do { if (dr_probe_n++ < 50000000) fprintf(stderr, __VA_ARGS__); } while (0)
+#endif
+#else
+#define DR_OVERLAP(a,l) 0
+#define DR_PROBE(...) ((void)0)
+#endif
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -149,6 +177,7 @@ typedef struct {
     uint32_t instr_count;
     uint32_t x86_end_ip;  /* expected IP after block (if no control flow) */
     uint8_t  valid;       /* 0 = free slot. Not x86_pc==0, which is a real address. */
+    uint16_t next_in_region; /* next live block whose x86_pc is in the same 16-byte region */
 } block_entry_t;
 
 static block_entry_t block_cache[MAX_BLOCKS];
@@ -157,6 +186,8 @@ static block_entry_t block_cache[MAX_BLOCKS];
  * of that same block; the generated code compares this epoch after the call
  * and leaves the block if it moved (see dinstr_exec_fb). */
 volatile uint32_t dr_inval_epoch = 0;
+
+
 
 /*
  * Lookup acceleration.
@@ -212,6 +243,59 @@ static void code_map_remove(uint32_t pc, uint32_t len) {
         uint8_t* c = &code_map[r & (CODE_MAP_SIZE - 1)];
         if (*c != 255 && *c != 0) (*c)--;
     }
+}
+
+/*
+ * Region index for invalidation. Every live block is linked into the list for
+ * the 16-byte region where it STARTS. Blocks are at most MAX_BLOCK_BYTES long,
+ * so a write to [start, end) can only overlap blocks that start in
+ * [start - MAX_BLOCK_BYTES, end). The old scan visited every block slot on
+ * every store that touched a code region (~2000 per store).
+ */
+#define REGION_NONE     0xFFFFu
+#define MAX_BLOCK_BYTES 2048u
+static uint16_t region_head[CODE_MAP_SIZE];
+
+static uint32_t block_region(uint32_t idx) {
+    return (block_cache[idx].x86_pc >> CODE_REGION_SHIFT) & (CODE_MAP_SIZE - 1);
+}
+
+static void region_link(uint32_t idx) {
+    uint32_t r = block_region(idx);
+    block_cache[idx].next_in_region = region_head[r];
+    region_head[r] = (uint16_t)idx;
+}
+
+static void region_unlink(uint32_t idx) {
+    uint32_t r = block_region(idx);
+    uint16_t cur = region_head[r], prev = REGION_NONE;
+    while (cur != REGION_NONE) {
+        if (cur == idx) {
+            if (prev == REGION_NONE) region_head[r] = block_cache[cur].next_in_region;
+            else block_cache[prev].next_in_region = block_cache[cur].next_in_region;
+            return;
+        }
+        prev = cur;
+        cur = block_cache[cur].next_in_region;
+    }
+}
+
+/* The ONLY way a live block dies. Keeps code_map and the region index in step. */
+static void block_kill(uint32_t idx) {
+#ifdef DR_PROBE_ON
+    if (DR_OVERLAP(block_cache[idx].x86_pc, block_cache[idx].x86_len) && block_cache[idx].valid) {
+        if (dr_probe_inval)
+            DR_PROBE("KILL pc=%05X len=%u write=[%05X,+%u] writer=%04X:%04X\n",
+                     block_cache[idx].x86_pc, block_cache[idx].x86_len, dr_probe_wr, dr_probe_wlen,
+                     dr_probe_cpu ? dr_probe_cpu->segregs[regcs] : 0, dr_probe_cpu ? dr_probe_cpu->ip : 0);
+        else
+            DR_PROBE("EVICT pc=%05X len=%u\n", block_cache[idx].x86_pc, block_cache[idx].x86_len);
+    }
+#endif
+    if (!block_cache[idx].valid) return;
+    block_cache[idx].valid = 0;
+    region_unlink(idx);
+    code_map_remove(block_cache[idx].x86_pc, block_cache[idx].x86_len);
 }
 static int block_cache_count = 0;  /* high-water mark: slots [0, count) are allocated */
 
@@ -575,6 +659,7 @@ static void flush_all_blocks(void) {
     code_cache_pos = 0;
     block_cache_count = 0;
     memset(block_cache, 0, sizeof(block_cache));
+    memset(region_head, 0xFF, sizeof(region_head));
     memset(block_lookup, 0, sizeof(block_lookup));
     memset(block_set_rr, 0, sizeof(block_set_rr));
     block_alloc_hint = 0;
@@ -635,8 +720,7 @@ static int range_changed(uint32_t start, uint32_t end) {
 static void invalidate_block(uint32_t x86_pc) {
     for (int i = 0; i < block_cache_count; i++) {
         if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
-            block_cache[i].valid = 0;
-            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
+            block_kill((uint32_t)i);
         }
     }
 }
@@ -1187,6 +1271,9 @@ static uint32_t x86_instr_len(const uint8_t *mem, uint32_t avail) {
  * everything with a control effect. */
 static int fb_straight(uint8_t op, uint8_t modrm) {
     int reg = (modrm >> 3) & 7;
+    if (op == 0x98) return 1;                          /* CBW / CWDE */
+    if (op >= 0xA0 && op <= 0xA3) return 1;            /* MOV AL/AX <-> moffs */
+    if (op == 0x8C) return reg <= 5;                   /* MOV Ev, Sreg (reg 6/7 invalid) */
     if (op < 0x40 && (op & 7) <= 3) return 1;          /* ADD..CMP Eb/Ev/Gb/Gv */
     if (op >= 0x80 && op <= 0x85) return 1;            /* group 1 imm, TEST */
     if (op >= 0x86 && op <= 0x8B) return 1;            /* XCHG, MOV */
@@ -1203,6 +1290,10 @@ static int fb_straight(uint8_t op, uint8_t modrm) {
 }
 
 static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
+#ifdef DR_PROBE_ON
+    if (DR_OVERLAP(x86_pc, 1))
+        DR_PROBE("XLATE pc=%05X from=%04X:%04X\n", x86_pc, cpu->segregs[regcs], cpu->ip);
+#endif
     uint8_t* mem = memory_mapRead[x86_pc & MEMORY_MASK];
     if (mem == NULL || memory_mapReadCallback[x86_pc & MEMORY_MASK] != NULL) {
         return -1;  /* Can't translate MMIO */
@@ -1271,6 +1362,20 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
          * invalidated any block (a store over translated code, possibly this
          * block's own later instructions), leave the block through the normal
          * epilogue, made conditional on the helper's result. */
+        /* A segment-override prefix is part of the instruction it modifies, so
+         * "26 8B 07" is one straight-line instruction. The interpreter reads the
+         * prefix itself; we only need to know the real opcode that follows. */
+        if ((opcode == 0x26 || opcode == 0x2E || opcode == 0x36 || opcode == 0x3E ||
+             opcode == 0x64 || opcode == 0x65) && fb_straight(mem[offset + 1], mem[offset + 2])) {
+            emit_mov_reg(0, 4);
+            emit_bl(g_helpers.dinstr_exec_fb);
+            emit32(0xE3500000);          /* CMP R0, #0 */
+            emit32(0x18BD8C10);          /* LDMNE SP!, {r4,r10,r11,pc} */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
+            instr_count++;
+            continue;
+        }
         if (fb_straight(opcode, mem[offset + 1])) {
             emit_mov_reg(0, 4);
             emit_bl(g_helpers.dinstr_exec_fb);
@@ -2056,6 +2161,7 @@ block_done:
             slot->instr_count = (uint32_t)instr_count;  /* x86 INSTRUCTIONS */
             slot->x86_end_ip = (uint16_t)(cpu->ip + offset);
             slot->valid = 1;
+            region_link((uint32_t)(slot - block_cache));
             {
                 uint32_t set = block_set(x86_pc), w, pick = BLOCK_WAYS;
                 /* Take a free way (empty/stale entry or this slot itself),
@@ -2068,8 +2174,7 @@ block_done:
                     block_entry_t* victim;
                     pick = block_set_rr[set / BLOCK_WAYS]++ & (BLOCK_WAYS - 1);
                     victim = &block_cache[block_lookup[set + pick]];
-                    victim->valid = 0;
-                    code_map_remove(victim->x86_pc, victim->x86_len);
+                    block_kill((uint32_t)(victim - block_cache));
                 }
                 block_lookup[set + pick] = (uint16_t)(slot - block_cache);
             }
@@ -2088,6 +2193,12 @@ block_done:
      * at translation time, NOT on every execution (see the comment at the
      * execution site in dynrec_exec()). On ARMv5TE, cacheflush() is a
      * syscall; calling it per-block-execution was the dominant perf bug. */
+    /* cacheflush(start, END ADDRESS, flags). The end must be an address, not an
+     * offset: passing the bare code_cache_pos (a small offset below `start`)
+     * made the syscall fail with EINVAL and flush nothing, so on real ARM
+     * hardware the I-cache kept stale lines and the CPU executed old or
+     * garbage code (instant crash on enabling DR). qemu-user has no I-cache,
+     * which is why host/qemu tests never showed it. */
     cacheflush((long)(code_cache_base + start_pos),
                 (long)(code_cache_base + code_cache_pos),
                 0);
@@ -2157,7 +2268,9 @@ void dynrec_disable(void) {
 void dynrec_invalidate_range(uint32_t start, uint32_t len) {
     if (!dynrec_enabled) return;
     uint32_t end = start + len;
-    DRST(dr_st_inv_calls++);
+#ifdef DR_PROBE_ON
+    dr_probe_wr = start; dr_probe_wlen = len;
+#endif
     {
         /* Fast reject: no live block overlaps any 16-byte region touched. */
         uint32_t r = start >> CODE_REGION_SHIFT;
@@ -2168,39 +2281,34 @@ void dynrec_invalidate_range(uint32_t start, uint32_t len) {
         if (r > last) return;
     }
     /*
-	Interval intersection, not a start-address test. cpu_write() calls this
-	with len==1 for every byte written to RAM, so testing only
-	block.x86_pc == start meant a patch landing anywhere inside a
-	translated block left the stale block in the cache to be executed
-	again. A write at the very first byte of a block is rare; writes into
-	the interior are what actually happen (code loads, patches, SMC).
-    */
-    for (int i = 0; i < block_cache_count; i++) {
-        uint32_t block_end;
-        DRST(dr_st_inv_iters++);
-        if (!block_cache[i].valid) continue;
-        /*
-         * The footprint is [x86_pc, x86_pc + x86_len) and x86_len is the TRUE
-         * byte length of the block's x86 code, so a write to any byte of any
-         * instruction in the block -- including the ModR/M, SIB, displacement
-         * and immediate bytes of an instruction the block handed to the
-         * interpreter -- lands inside it. Charging those instructions 1 byte
-         * each (the old behaviour) left their remaining bytes outside the
-         * range, and a patch there failed to invalidate the block. See
-         * x86_instr_len() for how the length is obtained and why it never
-         * under-estimates.
-         */
-        block_end = block_cache[i].x86_pc + block_cache[i].x86_len;
-        if (block_cache[i].x86_pc < end && block_end > start
-            && range_changed(start > block_cache[i].x86_pc ? start : block_cache[i].x86_pc,
-                             end < block_end ? end : block_end)) {
-            DLOGI("invalidate: block at 0x%05X len=%u (instrs=%u) overlaps "
-                  "write 0x%05X..0x%05X",
-                  block_cache[i].x86_pc, block_cache[i].x86_len,
-                  block_cache[i].instr_count, start, end);
-            block_cache[i].valid = 0;
-            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
-            dr_inval_epoch++;
+     * Only blocks that start in [start - MAX_BLOCK_BYTES, end) can overlap,
+     * so walk just those regions' lists instead of every block slot.
+     * range_changed() still decides: a store of the same byte does not kill.
+     */
+    {
+        uint32_t lo = (start > MAX_BLOCK_BYTES) ? ((start - MAX_BLOCK_BYTES) >> CODE_REGION_SHIFT) : 0;
+        uint32_t hi = (end - 1) >> CODE_REGION_SHIFT;
+        uint32_t r;
+        for (r = lo; r <= hi; r++) {
+            uint16_t idx = region_head[r & (CODE_MAP_SIZE - 1)];
+            while (idx != REGION_NONE) {
+                uint16_t nxt = block_cache[idx].next_in_region;   /* read first: block_kill unlinks idx */
+                block_entry_t* blk = &block_cache[idx];
+                uint32_t block_end = blk->x86_pc + blk->x86_len;
+                if (blk->valid && blk->x86_pc < end && block_end > start
+                    && range_changed(start > blk->x86_pc ? start : blk->x86_pc,
+                                     end < block_end ? end : block_end)) {
+#ifdef DR_PROBE_ON
+                    dr_probe_inval = 1;
+#endif
+                    block_kill(idx);
+#ifdef DR_PROBE_ON
+                    dr_probe_inval = 0;
+#endif
+                    dr_inval_epoch++;
+                }
+                idx = nxt;
+            }
         }
     }
 }
@@ -2237,7 +2345,7 @@ uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
         if (block->arm_offset >= CODE_CACHE_SIZE) {
             crashlog("BLOCK_IN_GUARD: x86_pc=0x%05X arm_off=%u >= CODE_CACHE_SIZE, invalidating",
                      x86_pc, block->arm_offset);
-            block->valid = 0;
+            block_kill((uint32_t)(block - block_cache));
             block = NULL;
         }
     }

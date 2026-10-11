@@ -61,8 +61,21 @@ int dinstr_advance_ip(CPU_t* cpu, uint16_t n) {
 /* Execute one instruction via the interpreter — used for opcodes not
  * natively translated by the dynrec (ModR/M instructions, etc.)
  * Returns the number of bytes the instruction consumed (1-3). */
+#ifdef HOSTTEST
+uint64_t dr_hist[256], dr_hist_rep[256], dr_hist_0f[256], dr_hist_calls;
+static void dr_hist_note(CPU_t* cpu) {
+    uint32_t a = ((uint32_t)cpu->segregs[regcs] << 4) + cpu->ip; uint8_t b; int rep = 0, n = 0;
+    for (;;) { b = cpu_read(cpu, a++); if (b==0x26||b==0x2E||b==0x36||b==0x3E||b==0x66||b==0x67||b==0x64||b==0x65) { if (++n>6) break; continue; }
+               if (b==0xF2||b==0xF3) { rep=1; if (++n>6) break; continue; } break; }
+    dr_hist_calls++;
+    if (b==0x0F) dr_hist_0f[cpu_read(cpu,a)]++; else if (rep) dr_hist_rep[b]++; else dr_hist[b]++;
+}
+#endif
 int dinstr_exec_one(CPU_t* cpu) {
     uint16_t ip_before = cpu->ip;
+#ifdef HOSTTEST
+    dr_hist_note(cpu);
+#endif
     cpu_exec(cpu, 1);
     return cpu->ip - ip_before;
 }

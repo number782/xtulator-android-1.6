@@ -23,6 +23,7 @@
 #include <string.h>
 #include "pcspeaker.h"
 #include "../../timing.h"
+#include "../../chipset/i8253.h"
 
 void pcspeaker_setGateState(PCSPEAKER_t* spk, uint8_t gate, uint8_t value) {
 	spk->pcspeaker_gate[gate] = value;

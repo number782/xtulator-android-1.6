@@ -36,6 +36,8 @@ LOCAL_SRC_FILES := \
 
 LOCAL_C_INCLUDES := $(LOCAL_PATH)/../../XTulator
 
+# Stage 22 churn probe: to log block translate/evict/kill for 0x0660D-0x06629,
+# add -DDR_CHURN_PROBE to LOCAL_CFLAGS below (logcat tag XT-CHURN). Off by default.
 LOCAL_CFLAGS := -D__ANDROID__ -D__ARM_ARCH_5TE__ -O2 -g -std=gnu99
 
 LOCAL_ARM_MODE := arm

@@ -521,6 +521,11 @@ public class XTulatorActivity extends Activity {
         }
     }
 
+    private static boolean isWantedRootAsset(String name) {
+        return "roms".equals(name) || "disk.dat".equals(name)
+            || "disk.img".equals(name) || "fd.img".equals(name);
+    }
+
     private void copyAssetDir(AssetManager am, String assetDir, File outDir) throws IOException {
         String[] names = am.list(assetDir);
         Log.i("XTulator", "Listing assets in '" + assetDir + "': " + (names != null ? names.length : "null"));
@@ -531,6 +536,12 @@ public class XTulatorActivity extends Activity {
         outDir.mkdirs();
         for (String name : names) {
             if ("README.txt".equals(name) && assetDir.length() == 0) {
+                continue;
+            }
+            /* Android merges the framework's own assets (webkit/, images/, sounds/)
+             * into every app's AssetManager. Only copy what the emulator uses. */
+            if (assetDir.length() == 0 && !isWantedRootAsset(name)) {
+                Log.i("XTulator", "Skipping framework/unused asset: " + name);
                 continue;
             }
             String sub;
