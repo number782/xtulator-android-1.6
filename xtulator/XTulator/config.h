@@ -70,6 +70,13 @@
 */
 #define XT_ENABLE_AUDIO 0
 
+/*
+	Serial mouse byte poll rate. Was baudrate/9 = 12.8 kHz, i.e. 12,800 timer
+	callbacks a second to move bytes that arrive at ~130 bytes/s on a 1200 baud
+	Microsoft mouse.
+*/
+#define MOUSE_POLL_HZ 1000.0
+
 extern volatile uint8_t running;
 extern uint8_t videocard, showMIPS;
 extern double speedarg;

@@ -34,7 +34,7 @@ void pcspeaker_selectGate(PCSPEAKER_t* spk, uint8_t value) {
 
 void pcspeaker_callback(PCSPEAKER_t* spk) {
 	if (spk->pcspeaker_gateSelect == PC_SPEAKER_USE_TIMER2) {
-		if (spk->pcspeaker_gate[PC_SPEAKER_GATE_TIMER2] && spk->pcspeaker_gate[PC_SPEAKER_GATE_DIRECT]) {
+		if (i8253_getOut2() && spk->pcspeaker_gate[PC_SPEAKER_GATE_DIRECT]) {
 			if (spk->pcspeaker_amplitude < 15000) {
 				spk->pcspeaker_amplitude += PC_SPEAKER_MOVEMENT;
 			}
@@ -65,7 +65,10 @@ void pcspeaker_callback(PCSPEAKER_t* spk) {
 void pcspeaker_init(PCSPEAKER_t* spk) {
 	memset(spk, 0, sizeof(PCSPEAKER_t));
 	spk->pcspeaker_gateSelect = PC_SPEAKER_GATE_DIRECT;
+#if XT_ENABLE_AUDIO
+	/* 48 kHz callback: only worth its cost when something consumes the samples. */
 	timing_addTimer(pcspeaker_callback, spk, SAMPLE_RATE, TIMING_ENABLED);
+#endif
 }
 
 int16_t pcspeaker_getSample(PCSPEAKER_t* spk) {

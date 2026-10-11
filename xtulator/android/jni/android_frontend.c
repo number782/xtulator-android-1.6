@@ -27,6 +27,8 @@ static int g_fbH = 0;
 static pthread_mutex_t g_fbMtx = PTHREAD_MUTEX_INITIALIZER;
 
 static uint8_t g_lastScancode = 0;
+static volatile uint32_t g_frameSeq = 0;   /* bumped by every blit */
+static uint32_t g_lastSeq = 0xFFFFFFFFu;  /* last frame handed to Java */
 
 uint8_t android_keycode_to_scancode(int keycode)
 {
@@ -169,6 +171,7 @@ void sdlconsole_blit(uint32_t *pixels, int w, int h, int stride)
 	}
 	g_fbW = w;
 	g_fbH = h;
+	g_frameSeq++;
 	pthread_mutex_unlock(&g_fbMtx);
 }
 
@@ -250,6 +253,11 @@ int android_fb_get_dims_and_copy(int *w_out, int *h_out, int32_t *out, int count
 	*h_out = h;
 	int total = w * h;
 	int n = count < total ? count : total;
+	if (g_frameSeq == g_lastSeq) { /* nothing new since the last call */
+		pthread_mutex_unlock(&g_fbMtx);
+		return 0;
+	}
+	g_lastSeq = g_frameSeq;
 	for (int i = 0; i < n; i++) {
 		out[i] = (int32_t)(g_fb[i] | 0xFF000000u);
 	}

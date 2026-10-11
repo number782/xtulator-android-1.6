@@ -109,6 +109,14 @@ static void crashlog(const char* fmt, ...) {}
 
 volatile int dynrec_enabled = 0;
 
+#ifdef HOSTTEST
+/* Test-only counters (printed by the host harness). */
+uint64_t dr_st_dispatch, dr_st_find_iters, dr_st_inv_calls, dr_st_inv_iters, dr_st_translate, dr_st_tfail, dr_st_flush, dr_st_interp, dr_st_blkinstrs;
+#define DRST(x) (x)
+#else
+#define DRST(x) ((void)0)
+#endif
+
 /* ---- Code cache ---- */
 static uint8_t* code_cache_base = NULL;
 static uint32_t code_cache_pos = 0;
@@ -144,6 +152,53 @@ typedef struct {
 } block_entry_t;
 
 static block_entry_t block_cache[MAX_BLOCKS];
+
+/*
+ * Lookup acceleration.
+ *
+ * find_block() used to scan up to MAX_BLOCKS entries on every dispatch, and
+ * dynrec_invalidate_range() did the same on every guest memory WRITE (cpu_write
+ * calls it per byte).  Measured over the first 4M guest instructions of a boot:
+ * 1.6M invalidate calls looping 246M times (60 iterations per guest
+ * instruction) and 33M find iterations.  Neither is needed:
+ *
+ *   block_lookup  direct-mapped cache  hash(x86_pc) -> slot index, verified
+ *                 against the slot (so stale entries are harmless);
+ *   code_map      one byte per 16 bytes of guest address space = number of live
+ *                 blocks that overlap that region (sticky at 255).  A write to a
+ *                 region with a zero count cannot hit any block, so the common
+ *                 case (stack/data writes) costs one byte load.
+ */
+#define BLOCK_LOOKUP_BITS  10
+#define BLOCK_LOOKUP_SIZE  (1u << BLOCK_LOOKUP_BITS)
+#define CODE_REGION_SHIFT  4
+#define CODE_MAP_SIZE      (0x100000u >> CODE_REGION_SHIFT)
+static uint16_t block_lookup[BLOCK_LOOKUP_SIZE];
+static uint8_t  code_map[CODE_MAP_SIZE];
+
+static inline uint32_t block_hash(uint32_t pc) {
+    return (pc ^ (pc >> BLOCK_LOOKUP_BITS)) & (BLOCK_LOOKUP_SIZE - 1);
+}
+
+static void code_map_add(uint32_t pc, uint32_t len) {
+    uint32_t r, last;
+    if (len == 0) len = 1;
+    last = (pc + len - 1) >> CODE_REGION_SHIFT;
+    for (r = pc >> CODE_REGION_SHIFT; r <= last; r++) {
+        uint8_t* c = &code_map[r & (CODE_MAP_SIZE - 1)];
+        if (*c != 255) (*c)++;
+    }
+}
+
+static void code_map_remove(uint32_t pc, uint32_t len) {
+    uint32_t r, last;
+    if (len == 0) len = 1;
+    last = (pc + len - 1) >> CODE_REGION_SHIFT;
+    for (r = pc >> CODE_REGION_SHIFT; r <= last; r++) {
+        uint8_t* c = &code_map[r & (CODE_MAP_SIZE - 1)];
+        if (*c != 255 && *c != 0) (*c)--;
+    }
+}
 static int block_cache_count = 0;  /* high-water mark: slots [0, count) are allocated */
 
 /* ---- Dynrec statistics (for diagnostics) ---- */
@@ -306,65 +361,31 @@ static void emit_bl(uint32_t target_addr) {
     int32_t offset = (int32_t)(target_addr - (base_pc + 8)) / 4;
 
     if (offset > 8388607 || offset < -8388608) {
-        /* Target is out of BL's ±32MB range (24-bit signed offset). This is the
-         * normal case on the IS01: the code cache is mmap'd around 0x2d5b3000
-         * while the helpers live in libxtulator.so around 0x42000000, ~355MB
-         * apart, so *every* helper call lands here.
+        /* Target is out of BL's +/-32MB range. That is the normal case on the
+         * IS01: the code cache is mmap'd far from libxtulator.so, so *every*
+         * helper call lands here.
          *
-         * Emit an indirect call that materialises the FULL 32-bit target into
-         * R12 and uses BLX Rm. There is deliberately NO literal pool.
+         * Emit a three-word call sequence with the target address stored inline
+         * as a literal that is jumped over (never executed):
          *
-         * Do NOT "optimise" this into `LDR R12,[PC,#n]` + `.word target`:
-         * that is what this code used to do, and BLX's +8 bias put the pool
-         * word exactly at LR, so the helper's own address was executed as ARM
-         * code on every return from every helper call.
+         *     X+0:  ADD  LR, PC, #4        ; LR = (X+8)+4 = X+12
+         *     X+4:  LDR  PC, [PC, #-4]     ; PC = word at (X+4)+8-4 = X+8
+         *     X+8:  .word target
+         *     X+12: <caller's next word>   ; <- helper returns here
          *
-         * Build the full 32-bit address using the same shift-based approach as
-         * emit_movw: low 16 bits via emit_movw, then upper 16 bits via LSL #8
-         * and ORR. This works for ANY 32-bit address, unlike ORR immediates
-         * which only work for rotated-immediate encodable values. */
-/* Build the full 32-bit address using emit_movw-style for low16,
-          * then shift left 16 and add high16 via ORR. Works for ANY 32-bit value,
-          * uses only R12 (no temp regs). */
-         uint16_t low16 = target_addr & 0xFFFF;
-         uint16_t high16 = (target_addr >> 16) & 0xFFFF;
-
-         /* Build low16 in R12 using emit_movw logic */
-         uint32_t lo = low16 & 0xFF;
-         uint32_t hi = (low16 >> 8) & 0xFF;
-         if (hi == 0) {
-             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | lo);  /* MOV R12, #lo */
-         } else if (lo == 0) {
-             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | hi);  /* MOV R12, #hi */
-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 (x2 = LSL #8) */
-         } else {
-             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | hi);  /* MOV R12, #hi */
-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
-             emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo);  /* ORR R12, R12, #lo */
-         }
-
-         if (high16 != 0) {
-             /* Shift R12 left by 16 (LSL #8 twice) */
-             emit32(0xE1A00000 | (12 << 12) | 12 | (8 << 7));  /* MOV R12, R12, LSL #8 */
-             emit32(0xE1A00000 | (12 << 12) | 12 | (8 << 7));  /* MOV R12, R12, LSL #8 */
-
-             /* Build high16 into R12 using ORR for first byte */
-             uint32_t hi2 = (high16 >> 8) & 0xFF;
-             uint32_t lo2 = high16 & 0xFF;
-             if (hi2 != 0) {
-                 emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | hi2);  /* ORR R12, R12, #hi2 */
-                 emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
-                 emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
-                 if (lo2 != 0) {
-                     emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo2);  /* ORR R12, R12, #lo2 */
-                 }
-             } else if (lo2 != 0) {
-                 emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo2);  /* ORR R12, R12, #lo2 */
-             }
-         }
-        emit32(0xE12FFF3C);     /* BLX R12 — 0xE12FFF3C; NOT 0xE12FFF9C (that is MSR) */
+         * Why this and not the previous MOV/shift/ORR + BLX R12 build-up: that
+         * sequence shifted the already-built low half of the address up by 16
+         * and then shifted it again while assembling the high half, so for any
+         * target whose high half was non-zero (every library address) it
+         * produced a scrambled value (0x42001234 became 0x34004200).  Loading a
+         * literal cannot get that wrong, costs 2 executed instructions instead
+         * of up to 11, and needs no scratch register.  LR = X+12 is the word
+         * after the pool, so no "spacing word" is needed either.  ARMv5T: the
+         * LDR to PC interworks on bit 0, which is clear for an ARM-mode target.
+         */
+        emit32(0xE28FE004);          /* ADD LR, PC, #4 */
+        emit32(0xE51FF004);          /* LDR PC, [PC, #-4] */
+        emit32(target_addr);         /* literal pool word (jumped over by the return address) */
     } else {
         emit32(0xEB000000 | (offset & 0xFFFFFF));  /* BL -- `offset` was computed
                                                        * from base_pc_plus_8, the
@@ -540,11 +561,20 @@ static void flush_all_blocks(void) {
     code_cache_pos = 0;
     block_cache_count = 0;
     memset(block_cache, 0, sizeof(block_cache));
+    memset(block_lookup, 0, sizeof(block_lookup));
+    memset(code_map, 0, sizeof(code_map));
 }
 
 static block_entry_t* find_block(uint32_t x86_pc) {
+    uint32_t h = block_hash(x86_pc);
+    block_entry_t* b = &block_cache[block_lookup[h]];
+    if (b->valid && b->x86_pc == x86_pc) {
+        return b;
+    }
     for (int i = 0; i < block_cache_count; i++) {
+        DRST(dr_st_find_iters++);
         if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
+            block_lookup[h] = (uint16_t)i;
             return &block_cache[i];
         }
     }
@@ -570,6 +600,7 @@ static void invalidate_block(uint32_t x86_pc) {
     for (int i = 0; i < block_cache_count; i++) {
         if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
             block_cache[i].valid = 0;
+            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
         }
     }
 }
@@ -587,16 +618,16 @@ extern int dinstr_hlt(CPU_t* cpu);
 extern int dinstr_int(CPU_t* cpu, uint8_t intnum);
 extern int dinstr_mov_r8_imm8(CPU_t* cpu, uint8_t regnum, uint8_t imm);
 
-extern int dinstr_jmp_rel8(CPU_t* cpu, int8_t rel);
-extern int dinstr_jcond_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel);
-extern int dinstr_jmp_rel16(CPU_t* cpu, int16_t rel);
-extern int dinstr_call_rel16(CPU_t* cpu, int16_t rel);
+extern int dinstr_jmp_rel8(CPU_t* cpu, uint32_t rel);
+extern int dinstr_jcond_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel);
+extern int dinstr_jmp_rel16(CPU_t* cpu, uint32_t rel);
+extern int dinstr_call_rel16(CPU_t* cpu, uint32_t rel);
 extern int dinstr_ret_near(CPU_t* cpu);
-extern int dinstr_loop_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel);
-extern int dinstr_add_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
-extern int dinstr_cmp_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
-extern int dinstr_add_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_add_ax_imm16(CPU_t* cpu, uint16_t imm);
+extern int dinstr_loop_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel);
+extern int dinstr_add_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm);
+extern int dinstr_cmp_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm);
+extern int dinstr_add_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_add_ax_imm16(CPU_t* cpu, uint32_t imm);
 extern int dinstr_pushf(CPU_t* cpu);
 extern int dinstr_popf(CPU_t* cpu);
 extern int dinstr_inc_r8(CPU_t* cpu, uint8_t regnum);
@@ -615,8 +646,8 @@ extern int dinstr_advance_ip(CPU_t* cpu, uint16_t n);
 extern int dinstr_exec_one(CPU_t* cpu);
 
 /* TEST AL, Ib and TEST AX, Iv */
-extern int dinstr_test_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_test_ax_imm16(CPU_t* cpu, uint16_t imm);
+extern int dinstr_test_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_test_ax_imm16(CPU_t* cpu, uint32_t imm);
 
 /* Opcodes 0x80-0x8F: ModR/M-based group and data-movement opcodes */
 extern int dinstr_test_gb_eb(CPU_t* cpu);
@@ -631,20 +662,20 @@ extern int dinstr_cli(CPU_t* cpu);
 extern int dinstr_sti(CPU_t* cpu);
 extern int dinstr_cld(CPU_t* cpu);
 extern int dinstr_std(CPU_t* cpu);
-extern int dinstr_or_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_or_ax_imm16(CPU_t* cpu, uint16_t imm);
-extern int dinstr_xor_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_xor_ax_imm16(CPU_t* cpu, uint16_t imm);
-extern int dinstr_sub_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_sub_ax_imm16(CPU_t* cpu, uint16_t imm);
-extern int dinstr_cmp_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_cmp_ax_imm16(CPU_t* cpu, uint16_t imm);
-extern int dinstr_adc_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_adc_ax_imm16(CPU_t* cpu, uint16_t imm);
-extern int dinstr_sbb_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_sbb_ax_imm16(CPU_t* cpu, uint16_t imm);
-extern int dinstr_and_al_imm8(CPU_t* cpu, uint8_t imm);
-extern int dinstr_and_ax_imm16(CPU_t* cpu, uint16_t imm);
+extern int dinstr_or_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_or_ax_imm16(CPU_t* cpu, uint32_t imm);
+extern int dinstr_xor_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_xor_ax_imm16(CPU_t* cpu, uint32_t imm);
+extern int dinstr_sub_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_sub_ax_imm16(CPU_t* cpu, uint32_t imm);
+extern int dinstr_cmp_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_cmp_ax_imm16(CPU_t* cpu, uint32_t imm);
+extern int dinstr_adc_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_adc_ax_imm16(CPU_t* cpu, uint32_t imm);
+extern int dinstr_sbb_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_sbb_ax_imm16(CPU_t* cpu, uint32_t imm);
+extern int dinstr_and_al_imm8(CPU_t* cpu, uint32_t imm);
+extern int dinstr_and_ax_imm16(CPU_t* cpu, uint32_t imm);
 
 /*
  * On Android, libxtulator.so is built as a shared library (BUILD_SHARED_LIBRARY
@@ -1349,8 +1380,10 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             emit_mov_imm(2, mem[offset + 1]);
             emit_bl(g_helpers.dinstr_mov_r8_imm8);
             offset += 2;
-            pending_ip += 2;
-            instr_count++;
+            /* pending_ip / instr_count are updated once, at the common tail
+             * below. Doing it here as well double-counted every MOV r8,Ib: the
+             * block advanced IP 2 bytes too far and the next instruction (often
+             * MOV SS,AX) ran from the wrong address. */
             break;
 
         case 0x9C:  /* PUSHF */
@@ -1894,6 +1927,8 @@ block_done:
             slot->instr_count = (uint32_t)instr_count;  /* x86 INSTRUCTIONS */
             slot->x86_end_ip = (uint16_t)(cpu->ip + offset);
             slot->valid = 1;
+            code_map_add(x86_pc, (uint32_t)offset);
+            block_lookup[block_hash(x86_pc)] = (uint16_t)(slot - block_cache);
          }
      }
 
@@ -1970,6 +2005,16 @@ void dynrec_disable(void) {
 void dynrec_invalidate_range(uint32_t start, uint32_t len) {
     if (!dynrec_enabled) return;
     uint32_t end = start + len;
+    DRST(dr_st_inv_calls++);
+    {
+        /* Fast reject: no live block overlaps any 16-byte region touched. */
+        uint32_t r = start >> CODE_REGION_SHIFT;
+        uint32_t last = (end - 1) >> CODE_REGION_SHIFT;
+        for (; r <= last; r++) {
+            if (code_map[r & (CODE_MAP_SIZE - 1)]) break;
+        }
+        if (r > last) return;
+    }
     /*
 	Interval intersection, not a start-address test. cpu_write() calls this
 	with len==1 for every byte written to RAM, so testing only
@@ -1980,6 +2025,7 @@ void dynrec_invalidate_range(uint32_t start, uint32_t len) {
     */
     for (int i = 0; i < block_cache_count; i++) {
         uint32_t block_end;
+        DRST(dr_st_inv_iters++);
         if (!block_cache[i].valid) continue;
         /*
          * The footprint is [x86_pc, x86_pc + x86_len) and x86_len is the TRUE
@@ -1999,6 +2045,7 @@ void dynrec_invalidate_range(uint32_t start, uint32_t len) {
                   block_cache[i].x86_pc, block_cache[i].x86_len,
                   block_cache[i].instr_count, start, end);
             block_cache[i].valid = 0;
+            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
         }
     }
 }
@@ -2024,6 +2071,9 @@ int dynrec_exec(CPU_t* cpu, I8259_t* i8259, int max_instr) {
         }
 
 uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
+        if (trace_flags & TRACE_FLAG_CPU) {
+            __android_log_print(ANDROID_LOG_ERROR, "XTulator-TRACE", "DYNREC_EXEC: x86_pc=0x%05X hlt=%d total=%d/%d", x86_pc, cpu->hltstate, total_executed, max_instr);
+        }
     block_entry_t* block = find_block(x86_pc);
 
     if (block != NULL) {
@@ -2040,7 +2090,9 @@ uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
     if (block != NULL) {
      } else {
         int result = translate_block(cpu, x86_pc, MAX_INSTRUCTIONS);
+        DRST(dr_st_translate++);
         if (result < 0 || result == 0) {
+            DRST(dr_st_tfail++);
             /* Can't translate or empty block — use interpreter */
              int batch = (max_instr - total_executed);
              if (batch > 1000) batch = 1000;
@@ -2092,9 +2144,16 @@ uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
      * epilogue comparison below. */
     g_cur_r4_in = dynrec_read_r4();
 
+    if (trace_flags & TRACE_FLAG_CPU) {
+        __android_log_print(ANDROID_LOG_ERROR, "XTulator-TRACE", "DYNREC_EXEC: BEFORE block=0x%05X ip=0x%04X instr_count=%d x86_len=%d total=%d/%d", x86_pc, cpu->ip, block->instr_count, block->x86_len, total_executed, max_instr);
+    }
+    DRST(dr_st_dispatch++); DRST(dr_st_blkinstrs += block->instr_count);
     g_active_blocks++;
     func(cpu);
     g_active_blocks--;
+    if (trace_flags & TRACE_FLAG_CPU) {
+        __android_log_print(ANDROID_LOG_ERROR, "XTulator-TRACE", "DYNREC_EXEC: AFTER  block=0x%05X ip=0x%04X total=%d/%d", x86_pc, cpu->ip, total_executed, max_instr);
+    }
 
     /* A caller_r4 != exit_r4 mismatch means the block's epilogue
      * `pop {r4,...}` failed to restore R4. */
@@ -2110,16 +2169,18 @@ uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
     g_cur_r4_in = 0;
 
     dynrec_native_blocks++;
+#ifdef HOSTTEST
+    if (getenv("DRDEBUG")) fprintf(stderr, "DRBLK pc=%05X instrs=%u x86len=%u ip_before=%04X ip_after=%04X\n", x86_pc, block->instr_count, block->x86_len, ip_before, cpu->ip);
+#endif
 
-    /* The generated code advances cpu->ip itself (see emit_advance_ip), so
-     * after a block that had no terminator cpu->ip should already equal
-     * expected_end_ip. A block ending in jmp/call/ret/int legitimately
-     * leaves it elsewhere, so only the unchanged case is suspicious. */
-    if (cpu->ip == ip_before && block->x86_len > 0) {
-        crashlog("IP_DESYNC: x86_pc=0x%05X ip unchanged at 0x%04X, expected 0x%04X",
-                 x86_pc, ip_before, expected_end_ip);
-        cpu->ip = expected_end_ip;
-    }
+    /* NOTE: there used to be an "IP_DESYNC" heuristic here that forced
+     * cpu->ip = expected_end_ip whenever a block left ip unchanged. That is
+     * wrong for any instruction that legitimately stays put: REP-prefixed
+     * string ops (the interpreter executes ONE iteration and rewinds ip to the
+     * prefix until CX hits zero), JMP $, and HLT.  It silently dropped every
+     * remaining iteration of the first REP STOSW in the BIOS and derailed the
+     * guest.  Generated blocks advance ip themselves (emit_advance_ip), so no
+     * fix-up is needed. */
 
     /* Removed duplicate redundant check — this was a copy-paste error */
     if (cpu->hltstate || cpu->trap_toggle) {

@@ -21,7 +21,6 @@
 #define _I8253_H_
 
 #include <stdint.h>
-#include <stdint.h>
 #include "i8259.h"
 
 extern uint64_t i8253_irq0_count;
@@ -58,10 +57,16 @@ typedef struct {
 	uint8_t out[3];
 	I8253CB_t cbdata;
 	uint32_t timer_id;
+	/* Lazy (time-derived) counter model -- see i8253.c */
+	uint64_t loadtime[3];     /* host time (us) at which the counter was last (re)loaded */
+	uint8_t wff[3];           /* write flip-flop (LSB/MSB) */
+	uint8_t rff[3];           /* read flip-flop (LSB/MSB) */
+	uint8_t latched[3];       /* a latched value is waiting to be read */
 } I8253_t;
 
 void i8253_write(I8253_t* i8253, uint16_t portnum, uint8_t value);
 uint8_t i8253_read(I8253_t* i8253, uint16_t portnum);
 void i8253_init(I8253_t* i8253, I8259_t* i8259, PCSPEAKER_t* pcspeaker);
+uint8_t i8253_getOut2(void);
 
 #endif

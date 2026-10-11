@@ -32,7 +32,7 @@ typedef struct TIMER_s {
 	faithfully. Callbacks that are genuinely expensive per call (see
 	timing_setCatchup) must be given a smaller budget.
 */
-#define TIMING_CATCHUP_DEFAULT	4096
+#define TIMING_CATCHUP_DEFAULT	4
 #define TIMING_CATCHUP_MAX		0xFFFFFFFFu
 
 #define TIMING_RINGSIZE	1024

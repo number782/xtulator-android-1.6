@@ -70,8 +70,8 @@ void utility_sleep(uint32_t ms) {
 #else
     int res;
     struct timespec ts;
-    ts.tv_sec = 0;
-    ts.tv_nsec = (long)ms * 1000;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     do {
         res = nanosleep(&ts, &ts);
     } while (res && errno == EINTR);

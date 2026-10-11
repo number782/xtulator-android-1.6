@@ -16,11 +16,13 @@
 */
 
 #include <stdint.h>
+#include <android/log.h>
 #include "cpu.h"
 #include "../memory.h"
 #include "../chipset/i8259.h"
 
 extern const uint8_t byteregtable[8];
+static uint8_t calc_parity(uint8_t val);
 
 /* ---- Simple opcodes ---- */
 
@@ -66,34 +68,30 @@ int dinstr_exec_one(CPU_t* cpu) {
 /* ---- Register 16-bit operations ---- */
 
 int dinstr_inc_r16(CPU_t* cpu, uint8_t regnum) {
-    uint16_t val = cpu->regs.wordregs[regnum];
-    uint16_t res = val + 1;
-    cpu->cf = cpu->oldcf;  /* INC preserves CF */
-    
-    uint16_t tmp = (uint16_t)(val + 1);
-    if (!tmp) cpu->zf = 1; else cpu->zf = 0;
-    if (tmp & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    /* AF: set if low nibble overflow */
-    if (((val & 0x0F) + 1) > 0x0F) cpu->af = 1; else cpu->af = 0;
-    /* OF for INC: set if result is 0x8000 (overflow from 0x7FFF) */
-    if (val == 0x7FFF) cpu->of = 1; else cpu->of = 0;
-    
-    cpu->regs.wordregs[regnum] = res;
+    /* Mirrors interpreter INC: ADD with 1, every flag but CF updated. */
+    uint16_t v1 = cpu->regs.wordregs[regnum & 7];
+    uint32_t dst = (uint32_t)v1 + 1u;
+    uint16_t res = (uint16_t)dst;
+    cpu->zf = !res;
+    cpu->sf = (res & 0x8000) ? 1 : 0;
+    cpu->pf = calc_parity(res & 0xFF);
+    cpu->of = (((dst ^ v1) & (dst ^ 1u) & 0x8000) == 0x8000);
+    cpu->af = (((v1 ^ 1u ^ dst) & 0x10) == 0x10);
+    cpu->regs.wordregs[regnum & 7] = res;
     return 0;
 }
 
 int dinstr_dec_r16(CPU_t* cpu, uint8_t regnum) {
-    uint16_t val = cpu->regs.wordregs[regnum];
-    uint16_t res = val - 1;
-    cpu->cf = cpu->oldcf;  /* DEC preserves CF */
-    
-    uint16_t tmp = (uint16_t)(val - 1);
-    if (!tmp) cpu->zf = 1; else cpu->zf = 0;
-    if (tmp & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    if ((val & 0x0F) < 1) cpu->af = 1; else cpu->af = 0;
-    if (val == 0x8000) cpu->of = 1; else cpu->of = 0;
-    
-    cpu->regs.wordregs[regnum] = res;
+    /* Mirrors interpreter DEC: SUB 1, every flag but CF updated. */
+    uint16_t v1 = cpu->regs.wordregs[regnum & 7];
+    uint32_t dst = (uint32_t)v1 - 1u;
+    uint16_t res = (uint16_t)dst;
+    cpu->zf = !res;
+    cpu->sf = (res & 0x8000) ? 1 : 0;
+    cpu->pf = calc_parity(res & 0xFF);
+    cpu->of = (((dst ^ v1) & (v1 ^ 1u) & 0x8000) == 0x8000);
+    cpu->af = (((v1 ^ 1u ^ dst) & 0x10) == 0x10);
+    cpu->regs.wordregs[regnum & 7] = res;
     return 0;
 }
 
@@ -124,14 +122,16 @@ int dinstr_mov_r8_imm8(CPU_t* cpu, uint8_t regnum, uint8_t imm) {
 
 /* ---- Control flow ---- */
 
-int dinstr_jmp_rel8(CPU_t* cpu, int8_t rel) {
+int dinstr_jmp_rel8(CPU_t* cpu, uint32_t rel_raw) {
+    int8_t rel = (int8_t)rel_raw;  /* callers pass a zero-extended byte; sign-extend here */
     cpu->ip += 2;
     cpu->ip += rel;
     /* JMP terminates the basic block */
     return 1;
 }
 
-int dinstr_jcond_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel) {
+int dinstr_jcond_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel_raw) {
+    int8_t rel = (int8_t)rel_raw;  /* callers pass a zero-extended byte; sign-extend here */
     int taken = 0;
 
     switch (opcode) {
@@ -161,14 +161,16 @@ int dinstr_jcond_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel) {
     return 0;  /* Continue the block — execution flows sequentially if not taken */
 }
 
-int dinstr_jmp_rel16(CPU_t* cpu, int16_t rel) {
+int dinstr_jmp_rel16(CPU_t* cpu, uint32_t rel_raw) {
+    int16_t rel = (int16_t)rel_raw;
     cpu->ip += 3;
     cpu->ip += rel;
     /* JMP terminates the basic block */
     return 1;
 }
 
-int dinstr_call_rel16(CPU_t* cpu, int16_t rel) {
+int dinstr_call_rel16(CPU_t* cpu, uint32_t rel_raw) {
+    int16_t rel = (int16_t)rel_raw;
     cpu->regs.wordregs[regsp] -= 2;
     putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], cpu->ip + 3);
     cpu->ip += 3 + rel;
@@ -191,7 +193,8 @@ int dinstr_ret_near(CPU_t* cpu) {
 /* 0xE3: JCXZ — jump if CX==0 */
 /* opcode: 0xE0 (LOOPNZ), 0xE1 (LOOPZ), 0xE2 (LOOP), 0xE3 (JCXZ)
  * rel: signed 8-bit displacement */
-int dinstr_loop_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel) {
+int dinstr_loop_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel_raw) {
+    int8_t rel = (int8_t)rel_raw;
     cpu->ip += 2;  /* advance past opcode + rel8 */
     cpu->regs.wordregs[regcx] = (uint16_t)(cpu->regs.wordregs[regcx] - 1);
     switch (opcode) {
@@ -224,7 +227,13 @@ int dinstr_int(CPU_t* cpu, uint8_t intnum) {
 
 int dinstr_pushf(CPU_t* cpu) {
     cpu->regs.wordregs[regsp] -= 2;
-    putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], makeflagsword(cpu));
+    /* Same image as the interpreter's 0x9C: the V20/8086 build sets the high
+     * flag bits (0xF800 / 0x0800), which software such as CPU detection reads. */
+#ifdef CPU_SET_HIGH_FLAGS
+    putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], makeflagsword(cpu) | 0xF800);
+#else
+    putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], makeflagsword(cpu) | 0x0800);
+#endif
     return 0;
 }
 
@@ -280,68 +289,25 @@ int dinstr_dec_r8(CPU_t* cpu, uint8_t regnum) {
 
 /* ---- Arithmetic with immediate ---- */
 
-int dinstr_add_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm) {
-    uint16_t v1 = cpu->regs.wordregs[regnum];
-    uint32_t dst = (uint32_t)v1 + (uint32_t)imm;
-    
-    cpu->res16 = (uint16_t)dst;
-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
-    if (((dst ^ v1) & (dst ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-    
-    cpu->regs.wordregs[regnum] = cpu->res16;
+int dinstr_add_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm) {
+    cpu->regs.wordregs[regnum & 7] = cpu_alu16(cpu, 0, cpu->regs.wordregs[regnum & 7], (uint16_t)imm);
     return 0;
 }
 
 /* 0x04: ADD AL, Ib — Add immediate8 to AL, set all flags */
-int dinstr_add_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t v1 = cpu->regs.byteregs[regal];
-    uint16_t dst = (uint16_t)v1 + (uint16_t)imm;
-
-    cpu->res8 = (uint8_t)dst;
-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res8);
-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
-    if (((dst ^ v1) & (dst ^ imm) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.byteregs[regal] = cpu->res8;
+int dinstr_add_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 0, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x05: ADD AX, Iv — Add immediate16 to AX, set all flags */
-int dinstr_add_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t v1 = cpu->regs.wordregs[regax];
-    uint32_t dst = (uint32_t)v1 + (uint32_t)imm;
-
-    cpu->res16 = (uint16_t)dst;
-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
-    if (((dst ^ v1) & (dst ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.wordregs[regax] = cpu->res16;
+int dinstr_add_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 0, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
-int dinstr_cmp_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm) {
-    uint16_t v1 = cpu->regs.wordregs[regnum];
-    uint32_t dst = (uint32_t)v1 - (uint32_t)imm;
-    
-    cpu->res16 = (uint16_t)dst;
-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
-    if ((dst ^ v1) & (v1 ^ imm) & 0x8000) cpu->of = 1; else cpu->of = 0;
-    if ((v1 ^ imm ^ dst) & 0x10) cpu->af = 1; else cpu->af = 0;
-    
+int dinstr_cmp_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm) {
+    (void)cpu_alu16(cpu, 7, cpu->regs.wordregs[regnum & 7], (uint16_t)imm);
     return 0;
 }
 
@@ -597,237 +563,101 @@ int dinstr_mov_sw_ew(CPU_t* cpu) {
 }
 
 /* 0x0C: OR AL, Ib — OR AL with immediate8, store in AL */
-int dinstr_or_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t res = cpu->regs.byteregs[regal] | imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res);
-    cpu->cf = 0;
-    cpu->of = 0;
-    cpu->regs.byteregs[regal] = res;
+int dinstr_or_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 1, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x0D: OR AX, Iv — OR AX with immediate16, store in AX */
-int dinstr_or_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t res = cpu->regs.wordregs[regax] | imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res & 0xFF);
-    cpu->cf = 0;
-    cpu->of = 0;
-    cpu->regs.wordregs[regax] = res;
+int dinstr_or_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 1, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
 /* 0x34: XOR AL, Ib — XOR AL with immediate8, store in AL */
-int dinstr_xor_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t res = cpu->regs.byteregs[regal] ^ imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res);
-    cpu->cf = 0;
-    cpu->of = 0;
-    cpu->regs.byteregs[regal] = res;
+int dinstr_xor_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 6, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x35: XOR AX, Iv — XOR AX with immediate16, store in AX */
-int dinstr_xor_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t res = cpu->regs.wordregs[regax] ^ imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res & 0xFF);
-    cpu->cf = 0;
-    cpu->of = 0;
-    cpu->regs.wordregs[regax] = res;
+int dinstr_xor_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 6, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
 /* ---- SUB immediate ---- */
 
 /* 0x2C: SUB AL, Ib — Subtract immediate8 from AL, set all flags */
-int dinstr_sub_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t v1 = cpu->regs.byteregs[regal];
-    uint16_t dst = (uint16_t)v1 - (uint16_t)imm;
-
-    cpu->res8 = (uint8_t)dst;
-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res8);
-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
-    if (((v1 ^ imm ^ dst) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.byteregs[regal] = cpu->res8;
+int dinstr_sub_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 5, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x2D: SUB AX, Iv — Subtract immediate16 from AX, set all flags */
-int dinstr_sub_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t v1 = cpu->regs.wordregs[regax];
-    uint32_t dst = (uint32_t)v1 - (uint32_t)imm;
-
-    cpu->res16 = (uint16_t)dst;
-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
-    if (((dst ^ v1) & (v1 ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.wordregs[regax] = cpu->res16;
+int dinstr_sub_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 5, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
 /* ---- CMP immediate ---- */
 
 /* 0x3C: CMP AL, Ib — Subtract immediate8 from AL, set flags, discard result */
-int dinstr_cmp_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t v1 = cpu->regs.byteregs[regal];
-    uint16_t dst = (uint16_t)v1 - (uint16_t)imm;
-
-    cpu->res8 = (uint8_t)dst;
-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res8);
-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
-    if (((v1 ^ imm ^ dst) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    /* CMP discards result — don't write back */
+int dinstr_cmp_al_imm8(CPU_t* cpu, uint32_t imm) {
+    (void)cpu_alu8(cpu, 7, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x3D: CMP AX, Iv — Subtract immediate16 from AX, set flags, discard result */
-int dinstr_cmp_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t v1 = cpu->regs.wordregs[regax];
-    uint32_t dst = (uint32_t)v1 - (uint32_t)imm;
-
-    cpu->res16 = (uint16_t)dst;
-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
-    if (((dst ^ v1) & (v1 ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    /* CMP discards result — don't write back */
+int dinstr_cmp_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    (void)cpu_alu16(cpu, 7, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
 /* 0x14: ADC AL, Ib — Add AL + immediate8 + CF, store in AL */
-int dinstr_adc_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t v1 = cpu->regs.byteregs[regal];
-    uint16_t dst = (uint16_t)v1 + (uint16_t)imm + cpu->cf;
-
-    cpu->res8 = (uint8_t)dst;
-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res8);
-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
-    if (((dst ^ v1) & (dst ^ imm) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.byteregs[regal] = cpu->res8;
+int dinstr_adc_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 2, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x15: ADC AX, Iv — Add AX + immediate16 + CF, store in AX */
-int dinstr_adc_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t v1 = cpu->regs.wordregs[regax];
-    uint32_t dst = (uint32_t)v1 + (uint32_t)imm + cpu->cf;
-
-    cpu->res16 = (uint16_t)dst;
-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
-    if (((dst ^ v1) & (dst ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.wordregs[regax] = cpu->res16;
+int dinstr_adc_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 2, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
 /* 0x1C: SBB AL, Ib — Subtract immediate8 + CF (borrow) from AL */
-int dinstr_sbb_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t v1 = cpu->regs.byteregs[regal];
-    uint16_t dst = (uint16_t)v1 - (uint16_t)(imm + cpu->cf);
-
-    cpu->res8 = (uint8_t)dst;
-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res8);
-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
-    if (((v1 ^ imm) & (v1 ^ dst) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.byteregs[regal] = cpu->res8;
+int dinstr_sbb_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 3, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x1D: SBB AX, Iv — Subtract immediate16 + CF (borrow) from AX */
-int dinstr_sbb_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t v1 = cpu->regs.wordregs[regax];
-    uint32_t dst = (uint32_t)v1 - (uint32_t)(imm + cpu->cf);
-
-    cpu->res16 = (uint16_t)dst;
-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
-    if (((v1 ^ imm) & (v1 ^ dst) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
-
-    cpu->regs.wordregs[regax] = cpu->res16;
+int dinstr_sbb_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 3, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
 /* 0x24: AND AL, Ib — AND AL with immediate8, store in AL */
-int dinstr_and_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t res = cpu->regs.byteregs[regal] & imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res);
-    cpu->cf = 0;
-    cpu->of = 0;
-    cpu->regs.byteregs[regal] = res;
+int dinstr_and_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 4, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0x25: AND AX, Iv — AND AX with immediate16, store in AX */
-int dinstr_and_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t res = cpu->regs.wordregs[regax] & imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res & 0xFF);
-    cpu->cf = 0;
-    cpu->of = 0;
-    cpu->regs.wordregs[regax] = res;
+int dinstr_and_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 4, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }
 
 /* 0xA8: TEST AL, Ib — AND AL with immediate8, set flags, discard result */
-int dinstr_test_al_imm8(CPU_t* cpu, uint8_t imm) {
-    uint8_t res = cpu->regs.byteregs[regal] & imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res);
-    cpu->cf = 0;
-    cpu->of = 0;
-    /* TEST discards result — don't write back */
+int dinstr_test_al_imm8(CPU_t* cpu, uint32_t imm) {
+    cpu_test8(cpu, cpu->regs.byteregs[regal], (uint8_t)imm);
     return 0;
 }
 
 /* 0xA9: TEST AX, Iv — AND AX with immediate16, set flags, discard result */
-int dinstr_test_ax_imm16(CPU_t* cpu, uint16_t imm) {
-    uint16_t res = cpu->regs.wordregs[regax] & imm;
-    if (!res) cpu->zf = 1; else cpu->zf = 0;
-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
-    cpu->pf = calc_parity(res & 0xFF);
-    cpu->cf = 0;
-    cpu->of = 0;
-    /* TEST discards result — don't write back */
+int dinstr_test_ax_imm16(CPU_t* cpu, uint32_t imm) {
+    cpu_test16(cpu, cpu->regs.wordregs[regax], (uint16_t)imm);
     return 0;
 }

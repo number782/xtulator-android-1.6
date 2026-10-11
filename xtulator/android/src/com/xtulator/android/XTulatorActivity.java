@@ -260,13 +260,27 @@ public class XTulatorActivity extends Activity {
         mTraceKeyboard = prefs.getBoolean("trace_keyboard", false);
         mTraceInterrupts = prefs.getBoolean("trace_interrupts", false);
         mTraceDisk = prefs.getBoolean("trace_disk", false);
-        mTraceMisc = true;
-        nativeSetTraceFlag(TRACE_MISC, true);
-        mTraceDiag = false;
-        nativeSetTraceFlag(TRACE_DIAG, true);
+        /*
+         * Trace flags and the dynrec switch used to be hard-wired ON here,
+         * overriding the menu toggles and saved prefs on every launch. CPU/MISC/
+         * INTERRUPT tracing costs a logd write every few dozen emulated
+         * instructions, which on this device starves the emulation. They now follow
+         * the menu / saved prefs (default off). Set FORCE_DEBUG_TRACES to true to
+         * get the old always-on behaviour for a diagnostic build.
+         */
+        final boolean FORCE_DEBUG_TRACES = false;
+        mTraceMisc = FORCE_DEBUG_TRACES || prefs.getBoolean("trace_misc", false);
+        mTraceDiag = prefs.getBoolean("trace_diag", false);
+        if (FORCE_DEBUG_TRACES) { mTraceCpu = true; mTraceInterrupts = true; }
+        nativeSetTraceFlag(TRACE_MISC, mTraceMisc);
+        nativeSetTraceFlag(TRACE_CPU, mTraceCpu);
+        nativeSetTraceFlag(TRACE_KEYBOARD, mTraceKeyboard);
+        nativeSetTraceFlag(TRACE_INTERRUPTS, mTraceInterrupts);
+        nativeSetTraceFlag(TRACE_DISK, mTraceDisk);
+        nativeSetTraceFlag(TRACE_DIAG, mTraceDiag);
         nativeSetTraceFlag(TRACE_VIDEO, false);
-        mDynrecEnabled = true;
-        nativeEnableDynrec(true);
+        mDynrecEnabled = prefs.getBoolean("dynrec", false);
+        nativeEnableDynrec(mDynrecEnabled);
         Log.i("XTulator", "Restored trace settings: cpu=" + mTraceCpu + " keyboard=" + mTraceKeyboard
               + " interrupts=" + mTraceInterrupts + " disk=" + mTraceDisk + " misc=" + mTraceMisc
               + " diag=" + mTraceDiag
@@ -636,8 +650,10 @@ public class XTulatorActivity extends Activity {
                                     + " mid=0x" + Integer.toHexString(midPix)
                                     + " fbW=" + mFbW + " fbH=" + mFbH);
                         }
-                        mBitmap.setPixels(mPixels, 0, mFbW, 0, 0, mFbW, mFbH);
-                        postInvalidate();
+                        if (copied > 0) { // 0 = native side has no new frame; skip the 1 MB copy + redraw
+                            mBitmap.setPixels(mPixels, 0, mFbW, 0, 0, mFbW, mFbH);
+                            postInvalidate();
+                        }
                     }
                 }
                 frameCount++;

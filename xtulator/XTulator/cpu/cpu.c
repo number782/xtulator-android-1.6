@@ -1118,6 +1118,49 @@ FUNC_INLINE void cpu_intcall(CPU_t* cpu, uint8_t intnum) {
 	cpu->tf = 0;
 }
 
+/*
+	ALU entry points for the dynamic recompiler.
+
+	The dynrec helpers used to carry their own copy of every flag formula and
+	several were wrong (8-bit SUB/CMP overflow, INC/DEC parity, ...).  Routing
+	them through the interpreter's own op_ and flag_ routines means the two engines
+	cannot disagree.  op is the x86 group-1 encoding: 0 ADD, 1 OR, 2 ADC, 3 SBB,
+	4 AND, 5 SUB, 6 XOR, 7 CMP.  The result is returned; for CMP the caller
+	discards it.  Flags are updated exactly as the interpreter would.
+*/
+uint8_t cpu_alu8(CPU_t* cpu, uint32_t op, uint8_t a, uint8_t b) {
+	cpu->oper1b = a;
+	cpu->oper2b = b;
+	switch (op & 7) {
+	case 0: op_add8(cpu); return cpu->res8;
+	case 1: op_or8(cpu);  return cpu->res8;
+	case 2: op_adc8(cpu); return cpu->res8;
+	case 3: op_sbb8(cpu); return cpu->res8;
+	case 4: op_and8(cpu); return cpu->res8;
+	case 5: op_sub8(cpu); return cpu->res8;
+	case 6: op_xor8(cpu); return cpu->res8;
+	default: flag_sub8(cpu, a, b); return a;
+	}
+}
+
+uint16_t cpu_alu16(CPU_t* cpu, uint32_t op, uint16_t a, uint16_t b) {
+	cpu->oper1 = a;
+	cpu->oper2 = b;
+	switch (op & 7) {
+	case 0: op_add16(cpu); return cpu->res16;
+	case 1: op_or16(cpu);  return cpu->res16;
+	case 2: op_adc16(cpu); return cpu->res16;
+	case 3: op_sbb16(cpu); return cpu->res16;
+	case 4: op_and16(cpu); return cpu->res16;
+	case 5: op_sub16(cpu); return cpu->res16;
+	case 6: op_xor16(cpu); return cpu->res16;
+	default: flag_sub16(cpu, a, b); return a;
+	}
+}
+
+void cpu_test8(CPU_t* cpu, uint8_t a, uint8_t b) { flag_log8(cpu, a & b); }
+void cpu_test16(CPU_t* cpu, uint16_t a, uint16_t b) { flag_log16(cpu, a & b); }
+
 void cpu_interruptCheck(CPU_t* cpu, I8259_t* i8259) {
 	/* get next interrupt from the i8259, if any */
 	uint8_t pending = i8259->irr & (~i8259->imr);
@@ -1292,6 +1335,10 @@ void cpu_exec(CPU_t* cpu, uint32_t execloops) {
 		*/
 		if (do_profile && (loopcount & 0xFF) == 0) {
 			cpu_profile_add(((uint32_t)cpu->segregs[regcs] << 4) + (uint32_t)cpu->ip);
+		}
+		/* DEBUG: log IP periodically to trace where BIOS cycles */
+		if (do_profile && (loopcount % 50 == 0)) {
+			__android_log_print(ANDROID_LOG_ERROR, "XTulator-TRACE", "CPU_TRACE: IP=0x%04X CS=0x%04X CX=0x%04X IF=%u", cpu->ip, cpu->segregs[regcs], cpu->regs.wordregs[regcx], cpu->ifl);
 		}
 
 		if (cpu->trap_toggle) {

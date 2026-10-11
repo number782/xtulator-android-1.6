@@ -80,6 +80,7 @@ uint8_t* vga_RAM[4]; //4 planes
 volatile uint64_t vga_hblankstart, vga_hblankend, vga_hblanklen, vga_dispinterval, vga_hblankinterval, vga_htotal;
 volatile uint64_t vga_vblankstart, vga_vblankend, vga_vblanklen, vga_vblankinterval, vga_frameinterval;
 volatile uint8_t vga_doRender = 0, vga_doBlit = 0;
+volatile uint8_t vga_dirty = 1;
 volatile double vga_targetFPS = 60, vga_lockFPS = 0;
 
 volatile uint32_t vga_hblankTimer, vga_hblankEndTimer, vga_drawTimer;
@@ -104,8 +105,9 @@ int vga_init() {
 	timing_addTimer(vga_blinkCallback, NULL, 3.75, TIMING_ENABLED);
 	vga_drawTimer = timing_addTimer(vga_drawCallback, NULL, vga_targetFPS, TIMING_ENABLED);
 	VGA_LOGI("vga_init: draw timer added, timer_id=%d, targetFPS=%.2f", vga_drawTimer, vga_targetFPS);
-	vga_hblankTimer = timing_addTimer(vga_hblankCallback, NULL, 10000, TIMING_ENABLED); //nonsense frequency values to begin with is fine
-	vga_hblankEndTimer = timing_addTimer(vga_hblankEndCallback, NULL, 100, TIMING_ENABLED); //same here
+	/* The hblank / hblank-end timers used to fire at the scanline rate (~31 kHz,
+	   twice) purely to wiggle two bits of port 0x3DA.  Those bits are now derived
+	   from the clock when the port is read (vga_status1_now()), so no timers. */
 	vga_curScanline = 0;
 
 	for (i = 0; i < 4; i++) { //4 planes of 64 KB (It's actually 64K addresses on a 32-bit data bus on real VGA hardware)
@@ -247,16 +249,12 @@ void vga_updateScanlineTiming() {
 		lastFPS = vga_targetFPS;
 	}
 
-	timing_updateInterval(vga_hblankTimer, vga_dispinterval);
-	timing_updateInterval(vga_hblankEndTimer, vga_hblankinterval);
-	timing_timerEnable(vga_hblankTimer);
-	timing_timerDisable(vga_hblankEndTimer);
 	if (vga_lockFPS == 0) {
 		timing_updateIntervalFreq(vga_drawTimer, vga_targetFPS);
 	}
 }
 
-void vga_update(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end_y) {
+static void vga_update_generic(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end_y) {
 	uint32_t addr, startaddr, cursorloc, cursor_x, cursor_y, fontbase, color32;
 	uint32_t scx, scy, x, y, hchars, divx, yscanpixels, xscanpixels, xstride, bpp, pixelsperbyte, shift;
 	uint8_t cc, attr, fontdata, blink, mode, colorset, intensity, blinkenable, cursorenable, dup9;
@@ -470,6 +468,188 @@ void vga_update(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end
 	}
 }
 
+
+/*
+	Render speed notes (ARMv5TE has no integer divide instruction: every / and %
+	by a non-constant is a call to a ~50-100 cycle library routine).
+
+	The reference renderer below (vga_update_generic) does 4-5 of them *per
+	pixel* in text mode, and one per pixel in the graphics modes.  A 720x400 text
+	frame is 288,000 pixels, i.e. well over a million divisions, which is a
+	large fraction of a second of the only CPU core per frame.  The functions
+	here produce bit-identical output (verified against the reference by
+	exhaustive/randomised comparison in the host test-suite) using one lookup
+	per character cell instead of one per pixel, and counters instead of
+	divisions in the graphics loops.
+*/
+
+static inline uint32_t vga_textcolor(uint8_t idx) {
+	uint32_t c = vga_attrd[idx & 0x0F] | (vga_attrd[0x14] << 4);
+	if (vga_attrd[0x10] & 0x80) { //P5, P4 replace
+		c = (c & 0xCF) | ((vga_attrd[0x14] & 3) << 4);
+	}
+	return vga_color(c);
+}
+
+static void vga_update_text(uint32_t w, uint32_t h) {
+	uint32_t hchars = vga_dbl ? 40 : 80;
+	uint32_t dots = vga_dots;
+	uint32_t pxw = vga_dbl ? 2 : 1;            //pixels per font column
+	uint32_t cellw = dots * pxw;               //pixels per character cell (divx)
+	uint32_t maxscan = (vga_crtcd[0x09] & 0x1F) + 1;
+	uint32_t fontbase = vga_fontbases[vga_seqd[0x03] & 7];
+	uint32_t startaddr = ((uint32_t)vga_crtcd[0xC] << 8) | (uint32_t)vga_crtcd[0xD];
+	uint32_t cursorloc = ((uint32_t)vga_crtcd[0xE] << 8) | (uint32_t)vga_crtcd[0xF];
+	uint32_t cursor_x = cursorloc % hchars, cursor_y = cursorloc / hchars;
+	uint8_t cursorenable = (vga_crtcd[0x0A] & 0x20) ? 0 : 1;
+	uint8_t curbeg = vga_crtcd[VGA_REG_DATA_CURSOR_BEGIN] & 31, curend = vga_crtcd[VGA_REG_DATA_CURSOR_END] & 31;
+	uint8_t curon = (vga_cursor_blink_state && cursorenable) ? 1 : 0;
+	uint32_t y, x, r, c;
+
+	vga_scandbl = 0;
+	if (dots > 9 || dots == 0) { //not a mode the reference handles sanely either; avoid undefined shifts
+		vga_update_generic(0, 0, w - 1, h - 1);
+		return;
+	}
+
+	for (y = 0; y * maxscan < h; y++) {
+		uint32_t rows = maxscan;
+		if ((y * maxscan) + rows > h) rows = h - (y * maxscan);
+		for (x = 0; x * cellw < w; x++) {
+			uint32_t addr = (startaddr + (y * hchars) + x) & 0xFFFF;
+			uint8_t cc = vga_RAM[0][addr];
+			uint8_t attr = vga_RAM[1][addr];
+			uint32_t fg = vga_textcolor(attr & 0x0F);
+			uint32_t bg = vga_textcolor(attr >> 4);
+			uint32_t cols = cellw;
+			uint8_t* font = &vga_RAM[2][fontbase + ((uint32_t)cc * 32)];
+			uint8_t dup9 = (cc >= 0xC0 && cc <= 0xDF) ? 1 : 0;
+			uint8_t iscursor = (curon && y == cursor_y && x == cursor_x) ? 1 : 0;
+			if ((x * cellw) + cols > w) cols = w - (x * cellw);
+
+			for (r = 0; r < rows; r++) {
+				uint32_t scy = (y * maxscan) + r;
+				uint32_t* dst = &vga_framebuffer[scy][x * cellw];
+				uint8_t fontdata = font[r];
+				if (iscursor && (uint8_t)(scy & 15) >= curbeg && (uint8_t)(scy & 15) <= curend) {
+					for (c = 0; c < cols; c++) dst[c] = fg;
+					continue;
+				}
+				for (c = 0; c < cols; c++) {
+					uint32_t col = (pxw == 2) ? (c >> 1) : c; //font column 0..dots-1
+					if (dup9 && col == 0) col = 1;
+					dst[c] = ((fontdata >> ((dots - 1) - col)) & 1) ? fg : bg;
+				}
+			}
+		}
+	}
+}
+
+static void vga_update_graphics(uint32_t w, uint32_t h) {
+	uint32_t xscanpixels, yscanpixels, bpp_mode;
+	uint32_t startaddr = ((uint32_t)vga_crtcd[0xC] << 8) | (uint32_t)vga_crtcd[0xD];
+	uint32_t pixelsperbyte, xstride, scy, scx, y, x, yadd, xadd;
+	uint32_t pal[256];
+	(void)bpp_mode;
+
+	if (vga_shiftmode & 0x02) {
+		xscanpixels = 2;
+		yscanpixels = (vga_crtcd[0x09] & 0x1F) + 1;
+	} else {
+		xscanpixels = (vga_seqd[0x01] & 0x08) ? 2 : 1;
+		yscanpixels = (vga_crtcd[0x09] & 0x80) ? 2 : 1;
+	}
+	switch (vga_shiftmode) {
+	case 0x00:
+		pixelsperbyte = 8;
+		bpp_mode = ((vga_attrd[0x12] & 0x0F) == 0x01) ? VGA_MODE_GRAPHICS_1BPP : VGA_MODE_GRAPHICS_4BPP;
+		break;
+	case 0x01:
+		pixelsperbyte = 4;
+		bpp_mode = VGA_MODE_GRAPHICS_2BPP;
+		break;
+	default:
+		pixelsperbyte = 1;
+		bpp_mode = VGA_MODE_GRAPHICS_8BPP;
+		break;
+	}
+	xstride = (w / xscanpixels) / pixelsperbyte;
+
+	/* palette-resolved colours, once per frame instead of once per pixel */
+	if (bpp_mode == VGA_MODE_GRAPHICS_8BPP) {
+		for (x = 0; x < 256; x++) pal[x] = vga_color(x);
+	} else if (bpp_mode != VGA_MODE_GRAPHICS_1BPP) {
+		for (x = 0; x < 16; x++) {
+			uint32_t c = vga_attrd[x & 0x0F] | (vga_attrd[0x14] << 4);
+			if (vga_attrd[0x10] & 0x80) c = (c & 0xCF) | ((vga_attrd[0x14] & 3) << 4);
+			pal[x] = vga_color(c);
+		}
+	}
+
+	for (scy = 0; scy < h; scy += yscanpixels) {
+		uint32_t isodd = 0;
+		uint32_t yy;
+		y = scy / yscanpixels;
+		yy = y;
+		if (bpp_mode == VGA_MODE_GRAPHICS_2BPP || bpp_mode == VGA_MODE_GRAPHICS_1BPP) {
+			isodd = y & 1;
+			yy = y >> 1;
+		}
+		for (scx = 0, x = 0; scx < w; scx += xscanpixels, x++) {
+			uint32_t color32;
+			switch (bpp_mode) {
+			case VGA_MODE_GRAPHICS_8BPP: {
+				uint32_t addr = ((y * xstride) + x) & 0xFFFF;
+				uint8_t plane = addr & 3;
+				addr = (addr >> 2) + startaddr;
+				color32 = pal[vga_RAM[plane][addr & 0xFFFF]];
+				break; }
+			case VGA_MODE_GRAPHICS_4BPP: {
+				uint32_t addr = (((y * xstride) + (x >> 3)) & 0xFFFF) + startaddr;
+				uint32_t shift = 7 - (x & 7);
+				uint8_t cc = (vga_RAM[0][addr & 0xFFFF] >> shift) & 1;
+				cc |= ((vga_RAM[1][addr & 0xFFFF] >> shift) & 1) << 1;
+				cc |= ((vga_RAM[2][addr & 0xFFFF] >> shift) & 1) << 2;
+				cc |= ((vga_RAM[3][addr & 0xFFFF] >> shift) & 1) << 3;
+				color32 = pal[cc];
+				break; }
+			case VGA_MODE_GRAPHICS_2BPP: {
+				uint32_t addr = (((8192 * isodd) + (yy * xstride) + (x >> 2)) & 0xFFFF) + startaddr;
+				uint32_t shift = (3 - (x & 3)) << 1;
+				uint8_t cc = (vga_RAM[addr & 1][addr >> 1] >> shift) & 3;
+				color32 = pal[cc];
+				break; }
+			default: { /* 1BPP */
+				uint32_t addr = (((8192 * isodd) + (yy * xstride) + (x >> 3)) & 0xFFFF) + startaddr;
+				uint32_t shift = 7 - (x & 7);
+				color32 = ((vga_RAM[0][addr] >> shift) & 1) ? 0xFFFFFFFF : 0x00000000;
+				break; }
+			}
+			for (yadd = 0; yadd < yscanpixels; yadd++) {
+				for (xadd = 0; xadd < xscanpixels; xadd++) {
+					vga_framebuffer[scy + yadd][scx + xadd] = color32;
+				}
+			}
+		}
+	}
+}
+
+void vga_update(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end_y) {
+	uint32_t w = vga_w, h = vga_h;
+
+	/* Fast paths render the whole frame (the only way it is ever called). */
+	if (start_x == 0 && start_y == 0 && end_x == w - 1 && end_y == h - 1 &&
+		w > 0 && h > 0 && w <= 1024 && h <= 1024) {
+		if (vga_attrd[0x10] & 1) {
+			vga_update_graphics(w, h);
+		} else {
+			vga_update_text(w, h);
+		}
+		return;
+	}
+	vga_update_generic(start_x, start_y, end_x, end_y);
+}
+
 void* vga_renderThread(void* dummy) {
 	// VGA_LOGI("vga_renderThread: started");
 	while (running) {
@@ -569,6 +749,7 @@ void vga_writecrtcd(uint8_t value) {
 }
 
 void vga_writeport(void* dummy, uint16_t port, uint8_t value) {
+	vga_dirty = 1;
 #ifdef DEBUG_VGA
 	debug_log(DEBUG_DETAIL, "Write VGA port: %02X -> %03X\r\n", value, port);
 #endif
@@ -747,12 +928,7 @@ uint8_t vga_readport(void* dummy, uint16_t port) {
 		break;
 case 0x3DA:
     vga_attrflipflop = 0; //because VGA is weird
-    // Compute vertical retrace status directly from scanline
-    // This is more reliable than relying on the hblank callback
-    if (vga_curScanline >= vga_vblankstart && vga_curScanline < vga_vblankend) {
-        return vga_status1 | 0x08;
-    }
-    return vga_status1;
+    return vga_status1_now();
 	}
 	return ret;
 }
@@ -771,6 +947,7 @@ uint8_t vga_dologic(uint8_t value, uint8_t latch) {
 }
 
 void vga_writememory(void* dummy, uint32_t addr, uint8_t value) {
+	vga_dirty = 1;
 	uint8_t temp, plane;
 	if ((vga_misc & 0x02) == 0) return; //RAM writes are disabled
 	addr -= 0xA0000;
@@ -868,31 +1045,54 @@ uint8_t vga_readmemory(void* dummy, uint32_t addr) {
 }
 
 void vga_drawCallback(void* dummy) {
-	// VGA_LOGI("vga_drawCallback: called, setting doRender=1, doBlit=1");
-	vga_doRender = 1;
-	vga_doBlit = 1;
+	/* Only redraw when something that can change the picture was touched
+	   (video RAM or any VGA register). A full 720x400 redraw costs far more
+	   than the rest of the emulator on this CPU, and an idle DOS prompt
+	   previously paid it ~70 times a second for an unchanged screen. */
+	if (vga_dirty) {
+		vga_dirty = 0;
+		vga_doRender = 1;
+		vga_doBlit = 1;
+	}
 }
 
 void vga_blinkCallback(void* dummy) {
 	vga_cursor_blink_state ^= 1;
+	vga_dirty = 1;
 }
 
 void vga_hblankCallback(void* dummy) {
-    timing_timerEnable(vga_hblankEndTimer);
-    vga_status1 |= 0x01;
-	vga_curScanline++;
-	if (vga_curScanline == vga_vblankstart) {
-		vga_status1 |= 0x08;
-	}
-	else if (vga_curScanline == vga_vblankend) {
-		vga_curScanline = 0;
-		vga_status1 &= 0xF7;
-	}
 }
 
 void vga_hblankEndCallback(void* dummy) {
-	timing_timerDisable(vga_hblankEndTimer);
-	vga_status1 &= 0xFE;
+}
+
+/*
+	Input status register 1 (0x3DA), derived from the clock instead of from
+	per-scanline timer callbacks.  Position in the frame = (now mod frame time);
+	bit 0 is "display disabled" (set during horizontal retrace/blanking), bit 3 is
+	vertical retrace.  Uses timing_cur, the sample timing_loop() already took.
+*/
+uint8_t vga_status1_now(void) {
+	uint8_t st = vga_status1 & 0xF6;
+	uint64_t t, inline_pos, line;
+
+	if (vga_dispinterval == 0 || vga_vblankend == 0) {
+		return vga_status1;
+	}
+	/* Frame = one scanline time x total scanlines, so the vblank/active split
+	   is self-consistent whatever the CRTC was programmed with. */
+	t = timing_cur % (vga_dispinterval * vga_vblankend);
+	line = t / vga_dispinterval;
+	inline_pos = t % vga_dispinterval;
+	if (vga_hblankinterval >= vga_dispinterval) vga_hblankinterval = vga_dispinterval / 8;
+	if (line >= vga_vblankstart && vga_vblankstart != 0) {
+		st |= 0x08 | 0x01; //vertical retrace also blanks the display
+	}
+	else if (inline_pos >= (vga_dispinterval - vga_hblankinterval)) {
+		st |= 0x01;
+	}
+	return st;
 }
 
 void vga_dumpregs() {

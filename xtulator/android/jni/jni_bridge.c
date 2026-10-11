@@ -67,6 +67,9 @@ static uint64_t pit_last_dump = 0;
  * per batch gives ~10× better throughput than 100 while keeping key latency
  * well under the BIOS typematic rate. */
 #define UNTHROTTLED_BATCH 1000
+#define UNTHROTTLED_BATCH_MIN 1000
+#define UNTHROTTLED_BATCH_MAX 8000
+#define TIMING_LOOPS_PER_SEC 150
 static uint32_t instructionsperloop = UNTHROTTLED_BATCH, cpuLimitTimer;
 static volatile uint8_t goCPU = 1, limitCPU = 0, emu_paused = 0;
 /* Ring buffer for key scancodes (press=0x00-0x7F, release=0x80-0xFF).
@@ -422,6 +425,18 @@ static void optimer(void* dummy) {
 	{
 		double mips = ((double)retired * 10.0) / 1000000.0;
 		cpu_speed_pct = (uint32_t)(mips / CPU_SPEED_REF_MHZ * 100.0 + 0.5);
+		/*
+			Unthrottled: size the batch so timing_loop() (one clock_gettime() plus
+			timer dispatch) runs ~TIMING_LOOPS_PER_SEC times a second whatever the
+			emulation speed. A fixed 1000 meant 250-1000 clock reads a second on this
+			device, each reported at 0.25-1.3ms. Clamp so key/IRQ latency stays low.
+		*/
+		if (!limitCPU && retired > 0) {
+			uint32_t b = (uint32_t)((retired * 10ULL) / TIMING_LOOPS_PER_SEC);
+			if (b < UNTHROTTLED_BATCH_MIN) b = UNTHROTTLED_BATCH_MIN;
+			if (b > UNTHROTTLED_BATCH_MAX) b = UNTHROTTLED_BATCH_MAX;
+			instructionsperloop = b;
+		}
 		if (showMIPS) {
 			debug_log(DEBUG_INFO, "%.3f MIPS (%u%%)\r", mips, (unsigned)cpu_speed_pct);
 		}
@@ -509,6 +524,10 @@ JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeInit(JNI
 		}
 	}
 
+	/* Cap the VGA redraw rate: the UI polls at ~20 fps, and every extra full
+	   720x400 redraw is CPU stolen from the 8088 core on a single-core device. */
+	vga_lockFPS = 20;
+
 	LOGI("nativeInit: calling ports_init");
 	ports_init();
 	LOGI("nativeInit: calling timing_init");
@@ -584,11 +603,6 @@ JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeRun(	JNI
 	uint32_t diag_count = 0;  /* Count how many blocks were executed natively */
 	while (running) {
 		loop_count++;
-		if (loop_count % 200 == 0) {
-			LOGE("nativeRun: loop %u, IP=%04X:%04X, dynrec_exec=%u, native=%u",
-				loop_count, machine.CPU.segregs[regcs], machine.CPU.ip,
-				(unsigned)instructionsperloop, diag_count);
-		}
 		cpu_interruptCheck(&machine.CPU, &machine.i8259);
 
         /* Use dynrec if available, otherwise fall back to interpreter */

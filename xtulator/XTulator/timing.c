@@ -38,6 +38,9 @@
 #endif
 
 uint64_t timing_cur;
+#ifdef XT_VIRTUAL_TIME
+uint64_t xt_virtual_us = 0;
+#endif
 uint64_t timing_freq;
 TIMER* timers = NULL;
 uint32_t timers_count = 0;
@@ -67,9 +70,13 @@ void timing_loop() {
 	QueryPerformanceCounter(&cur);
 	timing_cur = (uint64_t)cur.QuadPart;
 #else
+#ifdef XT_VIRTUAL_TIME
+	timing_cur = xt_virtual_us; //deterministic clock for differential testing
+#else
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	timing_cur = (uint64_t)ts.tv_sec * 1000000 + (uint64_t)(ts.tv_nsec / 1000);
+#endif
 #endif
 	for (i = 0; i < timers_count; i++) {
 		if (timing_cur < (timers[i].previous + timers[i].interval)) {
@@ -153,9 +160,13 @@ uint32_t timing_addTimerUsingInterval(void* callback, void* data, uint64_t inter
 	QueryPerformanceCounter(&cur);
 	timing_cur = (uint64_t)cur.QuadPart;
 #else
+#ifdef XT_VIRTUAL_TIME
+	timing_cur = xt_virtual_us; //deterministic clock for differential testing
+#else
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	timing_cur = (uint64_t)ts.tv_sec * 1000000 + (uint64_t)(ts.tv_nsec / 1000);
+#endif
 #endif
 	TIMING_LOGI("Adding timer %u, interval=%llu, callback=%p", timers_count, (unsigned long long)interval, callback);
 	temp = (TIMER*)realloc(timers, (size_t)sizeof(TIMER) * (timers_count + 1));
@@ -259,9 +270,13 @@ uint64_t timing_getCur() {
 	QueryPerformanceCounter(&cur);
 	timing_cur = (uint64_t)cur.QuadPart;
 #else
+#ifdef XT_VIRTUAL_TIME
+	timing_cur = xt_virtual_us; //deterministic clock for differential testing
+#else
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	timing_cur = (uint64_t)ts.tv_sec * 1000000 + (uint64_t)(ts.tv_nsec / 1000);
+#endif
 #endif
 
 	return timing_cur;

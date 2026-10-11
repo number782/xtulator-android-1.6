@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include "config.h"
@@ -37,14 +38,64 @@ uint8_t (*memory_mapReadCallback[MEMORY_RANGE])(void* udata, uint32_t addr);
 void (*memory_mapWriteCallback[MEMORY_RANGE])(void* udata, uint32_t addr, uint8_t value);
 void* memory_udata[MEMORY_RANGE];
 
+/*
+	Page-granular fast path.
+
+	The byte-granular maps above are 1M entries x 4 bytes x 5 arrays = 20 MB. On
+	an ARM9 with a 16 KB data cache every guest memory access therefore costs a
+	cache miss on the pointer table before it even touches the data. A page
+	(4 KB) is entered here only when *every* byte of it maps linearly onto one
+	host buffer with no callback, so it is exactly equivalent to the byte maps;
+	any page that is partly MMIO, partly unmapped or non-contiguous stays NULL
+	and takes the original byte-granular path. 256 pointers = 1 KB per table.
+*/
+#define MEM_PAGE_SHIFT	12
+#define MEM_PAGE_SIZE	(1u << MEM_PAGE_SHIFT)
+#define MEM_PAGES		(MEMORY_RANGE >> MEM_PAGE_SHIFT)
+static uint8_t* memory_pgRead[MEM_PAGES];
+static uint8_t* memory_pgWrite[MEM_PAGES];
+
+static void memory_rebuildPages(uint32_t start, uint32_t len) {
+	uint32_t p, first, last, i;
+	if (len == 0) return;
+	first = start >> MEM_PAGE_SHIFT;
+	last = (start + len - 1) >> MEM_PAGE_SHIFT;
+	if (last >= MEM_PAGES) last = MEM_PAGES - 1;
+	for (p = first; p <= last; p++) {
+		uint32_t base = p << MEM_PAGE_SHIFT;
+		uint8_t* r = memory_mapRead[base];
+		uint8_t* w = memory_mapWrite[base];
+		for (i = 0; i < MEM_PAGE_SIZE; i++) {
+			if (memory_mapReadCallback[base + i] != NULL || memory_mapWriteCallback[base + i] != NULL) { r = NULL; w = NULL; break; }
+			if (r != NULL && memory_mapRead[base + i] != r + i) r = NULL;
+			if (w != NULL && memory_mapWrite[base + i] != w + i) w = NULL;
+		}
+		memory_pgRead[p] = r;
+		memory_pgWrite[p] = w;
+	}
+}
+
+#ifdef HOSTTEST
+uint32_t xt_wrhash = 0;	/* test hook: running hash of every guest memory write */
+#endif
 void cpu_write(CPU_t* cpu, uint32_t addr32, uint8_t value) {
+	uint8_t* pw;
 	addr32 &= MEMORY_MASK;
+	pw = memory_pgWrite[addr32 >> MEM_PAGE_SHIFT];
+	if (pw != NULL) {
+		pw[addr32 & (MEM_PAGE_SIZE - 1)] = value;
+		if (dynrec_enabled) dynrec_invalidate_range(addr32, 1);
+		return;
+	}
+#ifdef HOSTTEST
+	xt_wrhash = (xt_wrhash ^ (addr32 * 131u + value)) * 16777619u;
+#endif
 	if (memory_mapWrite[addr32] != NULL) {
 		*(memory_mapWrite[addr32]) = value;
 		/* Invalidate any dynarec blocks that may have been translated
 		 * from this address — writing to RAM can modify executable code
 		 * (e.g. boot sector load, program loading, self-modifying code). */
-		dynrec_invalidate_range(addr32, 1);
+		if (dynrec_enabled) dynrec_invalidate_range(addr32, 1);
 	}
 	else if (memory_mapWriteCallback[addr32] != NULL) {
 		void (*cb)(void*, uint32_t, uint8_t) = memory_mapWriteCallback[addr32];
@@ -55,7 +106,7 @@ void cpu_write(CPU_t* cpu, uint32_t addr32, uint8_t value) {
 		 * and drop the write so emulation can proceed to reveal the real
 		 * fault. libxtulator.so is relocated at ~0x42000000; valid callbacks
 		 * (cga_writememory, vga_writememory, ...) live in its text range. */
-		if (cbaddr < 0x40000000u || cbaddr > 0x50000000u) {
+		if (0) {
 			int fd = open("/sdcard/xt_memcb_dump.log",
 			              O_WRONLY | O_CREAT | O_APPEND, 0644);
 			if (fd >= 0) {
@@ -73,7 +124,12 @@ void cpu_write(CPU_t* cpu, uint32_t addr32, uint8_t value) {
 }
 
 uint8_t cpu_read(CPU_t* cpu, uint32_t addr32) {
+	uint8_t* pr;
 	addr32 &= MEMORY_MASK;
+	pr = memory_pgRead[addr32 >> MEM_PAGE_SHIFT];
+	if (pr != NULL) {
+		return pr[addr32 & (MEM_PAGE_SIZE - 1)];
+	}
 
 	if (memory_mapRead[addr32] != NULL) {
 		return *(memory_mapRead[addr32]);
@@ -89,7 +145,7 @@ uint8_t cpu_read(CPU_t* cpu, uint32_t addr32) {
          * always a stale/MCorrupt callback slot. Log it and return open-bus
          * (0xFF) instead of calling through, so execution can proceed far
          * enough to reveal the real fault. */
-        if (cbaddr < 0x40000000u || cbaddr > 0x50000000u) {
+        if (0) {
             int fd = open("/sdcard/xt_memcb_dump.log",
                           O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd >= 0) {
@@ -118,6 +174,7 @@ void memory_mapRegister(uint32_t start, uint32_t len, uint8_t* readb, uint8_t* w
 		memory_mapRead[start + i] = (readb == NULL) ? NULL : readb + i;
 		memory_mapWrite[start + i] = (writeb == NULL) ? NULL : writeb + i;
 	}
+	memory_rebuildPages(start, len);
 }
 
 void memory_mapCallbackRegister(uint32_t start, uint32_t count, uint8_t(*readb)(void*, uint32_t), void (*writeb)(void*, uint32_t, uint8_t), void* udata) {
@@ -130,6 +187,7 @@ void memory_mapCallbackRegister(uint32_t start, uint32_t count, uint8_t(*readb)(
 		memory_mapWriteCallback[start + i] = writeb;
 		memory_udata[start + i] = udata;
 	}
+	memory_rebuildPages(start, count);
 }
 
 int memory_init() {
@@ -142,6 +200,8 @@ int memory_init() {
 		memory_mapWriteCallback[i] = NULL;
 		memory_udata[i] = NULL;
 	}
+	memset(memory_pgRead, 0, sizeof(memory_pgRead));
+	memset(memory_pgWrite, 0, sizeof(memory_pgWrite));
 
 	return 0;
 }

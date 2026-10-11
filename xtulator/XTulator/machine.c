@@ -220,7 +220,7 @@ int machine_init_generic_xt(MACHINE_t* machine) {
         MACHINE_LOGI("generic_xt: after uart_init UART0_MOUSE");
 		mouse_init(&machine->UART[0]);
         MACHINE_LOGI("generic_xt: after mouse_init");
-		timing_addTimer(mouse_rxpoll, NULL, baudrate / 9, TIMING_ENABLED);
+		timing_addTimer(mouse_rxpoll, NULL, MOUSE_POLL_HZ, TIMING_ENABLED);
         MACHINE_LOGI("generic_xt: after timing_addTimer");
 	}
 #ifdef ENABLE_TCP_MODEM
@@ -250,7 +250,7 @@ int machine_init_generic_xt(MACHINE_t* machine) {
         MACHINE_LOGI("generic_xt: after uart_init UART1_MOUSE");
 		mouse_init(&machine->UART[1]);
         MACHINE_LOGI("generic_xt: after mouse_init");
-		timing_addTimer(mouse_rxpoll, NULL, baudrate / 9, TIMING_ENABLED);
+		timing_addTimer(mouse_rxpoll, NULL, MOUSE_POLL_HZ, TIMING_ENABLED);
         MACHINE_LOGI("generic_xt: after timing_addTimer");
 	}
 #ifdef ENABLE_TCP_MODEM

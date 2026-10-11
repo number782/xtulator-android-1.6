@@ -69,6 +69,12 @@ typedef struct {
 
 void cpu_dumpmem(CPU_t* cpu, uint32_t linear, uint32_t len);
 
+/* ALU entry points shared with the dynamic recompiler (see cpu.c). */
+uint8_t cpu_alu8(CPU_t* cpu, uint32_t op, uint8_t a, uint8_t b);
+uint16_t cpu_alu16(CPU_t* cpu, uint32_t op, uint16_t a, uint16_t b);
+void cpu_test8(CPU_t* cpu, uint8_t a, uint8_t b);
+void cpu_test16(CPU_t* cpu, uint16_t a, uint16_t b);
+
 #define regax 0
 #define regcx 1
 #define regdx 2

@@ -27,6 +27,8 @@ void* vga_renderThread(void* cpu);
 void vga_writememory(void* dummy, uint32_t addr, uint8_t value);
 uint8_t vga_readmemory(void* dummy, uint32_t addr);
 void vga_dumpregs();
+uint8_t vga_status1_now(void);
+extern volatile uint8_t vga_dirty;
 
 //#define cga_color(c) ((uint32_t)cga_palette[c][0] | ((uint32_t)cga_palette[c][1]<<8) | ((uint32_t)cga_palette[c][2]<<16))
 #define vga_color(c) ((uint32_t)vga_palette[c][2] | ((uint32_t)vga_palette[c][1]<<8) | ((uint32_t)vga_palette[c][0]<<16))

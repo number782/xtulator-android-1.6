@@ -29,3 +29,9 @@ Crash = Thumb BLX to 0x2d5f3000 reached via an UNGUARDED indirect call in cpu_ex
 - Root cause of new crash: LOOP (0xE0-0xE3) opcodes missing from translate_block switch => falls to default => translation fails => interpreter fallback => interrupt fires during fallback => IVT entry (CS=0x0000, uninitialized) is jumped to => dynarec executes IVT data as x86 instructions => R4 (cpu ptr) corrupted by helper calls on IVT garbage bytes => null deref.
 - Additional missing opcodes in translate_block: 0xB0-0xB7 (MOV r8,imm8), 0x60-0x6F, 0xC0-0xEF, 0xFE-0xFF. All present in x86_instr_len but NOT in the translate_block switch.
 - Next fix: add cases for 0xE0-0xE3 (LOOP/LOOPE/LOOPNE/JCXZ) and 0xB0-0xB7 (MOV r8,imm8) to translate_block, then rebuild and retest.
+
+## Opcode merge assessment (2026-10-05)
+- 181 case labels in translate_block switch; 12 are prefix/escape bytes (0x0F, 0x26/0x2E/0x36/0x3E, 0x64/0x65/0x66/0x67, 0xF0, 0xF2/0xF3); 169 actual instruction opcodes.
+- 111 opcodes have true native codegen (dedicated helpers); 58 fall back to dinstr_exec_one.
+- Edited/dynrec.c converts 46 opcodes from interpreter to native, but 44 of those use NEW helper functions that read a non-existent cpu->modrm field (CPU_t has cpu->reg/rm/mode, not cpu->modrm) — compilation-failing; GRP1 reg-field map is wrong (1=SUB should be OR, 2=AND should be ADC, 3=XOR should be SBB, 4=OR should be AND, 5=CMP should be SUB); XCHG (0x86/0x87) conflated with MOV.
+- Only 0x8C (MOV Ew,Sw) and 0x8D (LEA Gv,M) use existing, correct helpers (dinstr_mov_ew_sw, dinstr_lea_gv_m) that self-decode ModR/M via modregrm(). Wired up with emit_advance_ip(1) to advance past opcode byte before helper reads ModR/M. Native count now 113; interpreter fallback now 56.
