@@ -152,6 +152,11 @@ typedef struct {
 } block_entry_t;
 
 static block_entry_t block_cache[MAX_BLOCKS];
+/* Bumped whenever a guest write invalidates a live block. A straight-line
+ * fallback instruction inside a block can overwrite bytes of later instructions
+ * of that same block; the generated code compares this epoch after the call
+ * and leaves the block if it moved (see dinstr_exec_fb). */
+volatile uint32_t dr_inval_epoch = 0;
 
 /*
  * Lookup acceleration.
@@ -675,6 +680,9 @@ extern int dinstr_sahf(CPU_t* cpu);
 extern int dinstr_lahf(CPU_t* cpu);
 extern int dinstr_advance_ip(CPU_t* cpu, uint16_t n);
 extern int dinstr_exec_one(CPU_t* cpu);
+extern int dinstr_rep_string(CPU_t* cpu, uint32_t opcode, uint32_t reptype, uint32_t len);
+extern int dinstr_exec_fb(CPU_t* cpu);
+extern volatile uint32_t dr_inval_epoch;
 
 /* TEST AL, Ib and TEST AX, Iv */
 extern int dinstr_test_al_imm8(CPU_t* cpu, uint32_t imm);
@@ -728,6 +736,8 @@ extern int dinstr_and_ax_imm16(CPU_t* cpu, uint32_t imm);
  */
 struct dynrec_helpers_t {
     uint32_t dinstr_exec_one;
+    uint32_t dinstr_rep_string;
+    uint32_t dinstr_exec_fb;
     uint32_t dinstr_advance_ip;
     uint32_t dinstr_nop;
     uint32_t dinstr_mov_r_i;
@@ -808,6 +818,8 @@ static void emit_advance_ip(uint32_t n) {
  * after the shared library is loaded (i.e. from dynrec_enable()). */
 static void dynrec_resolve_helpers(void) {
     g_helpers.dinstr_exec_one    = (uint32_t)(uintptr_t)&dinstr_exec_one;
+    g_helpers.dinstr_rep_string  = (uint32_t)(uintptr_t)&dinstr_rep_string;
+    g_helpers.dinstr_exec_fb     = (uint32_t)(uintptr_t)&dinstr_exec_fb;
     g_helpers.dinstr_advance_ip  = (uint32_t)(uintptr_t)&dinstr_advance_ip;
     g_helpers.dinstr_nop         = (uint32_t)(uintptr_t)&dinstr_nop;
     g_helpers.dinstr_mov_r_i     = (uint32_t)(uintptr_t)&dinstr_mov_r_i;
@@ -1168,6 +1180,28 @@ static uint32_t x86_instr_len(const uint8_t *mem, uint32_t avail) {
     return i;
 }
 
+/* Opcodes that are straight-line ALU / MOV / LEA with a ModR/M operand: no
+ * jump, call, stack or interrupt effect, and they all use the interpreter
+ * fallback today. The block may continue after them. Deliberately excluded:
+ * 86/87 XCHG, 8E (MOV Sreg, which can suppress interrupts), 8F (POP Ev), and
+ * everything with a control effect. */
+static int fb_straight(uint8_t op, uint8_t modrm) {
+    int reg = (modrm >> 3) & 7;
+    if (op < 0x40 && (op & 7) <= 3) return 1;          /* ADD..CMP Eb/Ev/Gb/Gv */
+    if (op >= 0x80 && op <= 0x85) return 1;            /* group 1 imm, TEST */
+    if (op >= 0x86 && op <= 0x8B) return 1;            /* XCHG, MOV */
+    if (op == 0x8D) return 1;                          /* LEA */
+    /* Groups below: only the members that cannot fault. MUL/DIV (F6/F7 /4-/7)
+     * can raise #DE and FE/C6/C7 with other reg values or shift /6 are invalid
+     * opcodes; any of those would vector the interpreter to a handler, so they
+     * stay block terminators. */
+    if (op == 0xC0 || op == 0xC1 || (op >= 0xD0 && op <= 0xD3)) return reg != 6;
+    if (op == 0xC6 || op == 0xC7) return reg == 0;     /* MOV Eb/Ev, imm */
+    if (op == 0xF6 || op == 0xF7) return reg == 0 || reg == 2 || reg == 3; /* TEST, NOT, NEG */
+    if (op == 0xFE) return reg <= 1;                   /* INC/DEC Eb */
+    return 0;
+}
+
 static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
     uint8_t* mem = memory_mapRead[x86_pc & MEMORY_MASK];
     if (mem == NULL || memory_mapReadCallback[x86_pc & MEMORY_MASK] != NULL) {
@@ -1230,6 +1264,24 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         uint32_t prev_offset = (uint32_t)offset;
         uint8_t opcode = mem[offset];
 
+        /* Straight-line fallback: run the instruction in the interpreter but
+         * KEEP the block going. The interpreter advances cpu->ip itself, and
+         * the flush at the top of this loop has already committed everything
+         * before it, so no pending_ip bookkeeping is needed. If the instruction
+         * invalidated any block (a store over translated code, possibly this
+         * block's own later instructions), leave the block through the normal
+         * epilogue, made conditional on the helper's result. */
+        if (fb_straight(opcode, mem[offset + 1])) {
+            emit_mov_reg(0, 4);
+            emit_bl(g_helpers.dinstr_exec_fb);
+            emit32(0xE3500000);          /* CMP R0, #0 */
+            emit32(0x18BD8C10);          /* LDMNE SP!, {r4,r10,r11,pc}  (= ARM_POP, cond NE) */
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
+            instr_count++;
+            continue;
+        }
+
         switch (opcode) {
         /* ---- x86 prefix bytes — skip and continue to next opcode ---- */
         case 0x2E:  /* CS segment override prefix */
@@ -1249,6 +1301,21 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
              * (16-bit MOV) being run as an 8-bit MOV. So hand the whole
              * prefixed instruction to the interpreter, which re-reads the
              * prefix itself. */
+            /* REP + MOVS/STOS/SCAS (no segment override): run the whole
+             * repeated loop in C instead of one interpreter trip per element. */
+            if ((opcode == 0xF2 || opcode == 0xF3) && (mem[offset + 1] == 0xA4 ||
+                mem[offset + 1] == 0xA5 || mem[offset + 1] == 0xAA ||
+                mem[offset + 1] == 0xAB || mem[offset + 1] == 0xAE ||
+                mem[offset + 1] == 0xAF)) {
+                emit_mov_reg(0, 4);
+                emit_movw(1, mem[offset + 1]);
+                emit_mov_imm(2, opcode == 0xF3 ? 1 : 2);
+                emit_mov_imm(3, 2);
+                emit_bl(g_helpers.dinstr_rep_string);
+                offset += 2;
+                instr_count++;
+                goto block_done;
+            }
             emit_mov_reg(0, 4);
             emit_bl(g_helpers.dinstr_exec_one);
             /* Charge the instruction its REAL byte length, not 1:
@@ -2133,6 +2200,7 @@ void dynrec_invalidate_range(uint32_t start, uint32_t len) {
                   block_cache[i].instr_count, start, end);
             block_cache[i].valid = 0;
             code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
+            dr_inval_epoch++;
         }
     }
 }
@@ -2257,7 +2325,6 @@ uint32_t x86_pc = (cpu->segregs[regcs] << 4) + cpu->ip;
 
     dynrec_native_blocks++;
 #ifdef HOSTTEST
-    if (getenv("DRDEBUG")) fprintf(stderr, "DRBLK pc=%05X instrs=%u x86len=%u ip_before=%04X ip_after=%04X\n", x86_pc, block->instr_count, block->x86_len, ip_before, cpu->ip);
 #endif
 
     /* NOTE: there used to be an "IP_DESYNC" heuristic here that forced

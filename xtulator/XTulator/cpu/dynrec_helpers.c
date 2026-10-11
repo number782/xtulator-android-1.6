@@ -20,6 +20,8 @@
 #include "cpu.h"
 #include "../memory.h"
 #include "../chipset/i8259.h"
+#include "../memory.h"
+#include "dynrec.h"
 
 extern const uint8_t byteregtable[8];
 static uint8_t calc_parity(uint8_t val);
@@ -63,6 +65,89 @@ int dinstr_exec_one(CPU_t* cpu) {
     uint16_t ip_before = cpu->ip;
     cpu_exec(cpu, 1);
     return cpu->ip - ip_before;
+}
+
+/* Store one byte (or two, for a word) without per-byte block invalidation.
+ * Callers invalidate the span they touched once. Falls back to cpu_write for
+ * addresses with no direct RAM mapping (MMIO), which invalidates itself. */
+static void rep_store(CPU_t* cpu, uint32_t addr, uint8_t lo, uint8_t hi, int word,
+                      uint32_t* wlo, uint32_t* whi) {
+    uint32_t a = addr & MEMORY_MASK;
+    uint8_t* p = memory_mapWrite[a];
+    if (p != NULL) { *p = lo; }
+    else { cpu_write(cpu, addr, lo); }
+    if (a < *wlo) *wlo = a;
+    if (a > *whi) *whi = a;
+    if (word) {
+        uint32_t b = (addr + 1) & MEMORY_MASK;
+        uint8_t* q = memory_mapWrite[b];
+        if (q != NULL) { *q = hi; }
+        else { cpu_write(cpu, addr + 1, hi); }
+        if (b < *wlo) *wlo = b;
+        if (b > *whi) *whi = b;
+    }
+}
+
+/* One interpreter instruction, reporting whether it invalidated any block.
+ * Returns nonzero if the translated block that called us is now stale. */
+extern volatile uint32_t dr_inval_epoch;
+int dinstr_exec_fb(CPU_t* cpu) {
+    uint32_t before = dr_inval_epoch;
+    cpu_exec(cpu, 1);
+    return dr_inval_epoch != before;
+}
+
+/* REP-prefixed MOVS/STOS/SCAS (no segment override), run to completion in C.
+ * The interpreter executes ONE iteration per dispatch (it rewinds IP to the
+ * prefix), so a REP STOSW of 4000 words cost 4000 trips through cpu_exec.
+ * reptype: 1 = REP/REPE (F3), 2 = REPNE (F2). len = prefix + opcode bytes.
+ * Flags for SCAS come from cpu_alu8/16 with op 7 (CMP), the same routine the
+ * interpreter's flag_sub uses. */
+int dinstr_rep_string(CPU_t* cpu, uint32_t opcode, uint32_t reptype, uint32_t len) {
+    /* Stores go straight to the RAM byte, and the span written is tracked so
+     * the block cache is invalidated ONCE at the end. Per-byte invalidation
+     * scanned every block for every byte of a 4000-word STOSW (measured: the
+     * same boot went from 41 s to 62 s with per-byte invalidation). */
+    uint32_t wlo = 0xFFFFFFFFu, whi = 0;
+    uint32_t dsb = segbase(cpu->segregs[regds]);
+    uint32_t esb = segbase(cpu->segregs[reges]);
+    int word = (opcode & 1) != 0;                 /* A5/AB/AF are word forms */
+    int elem = word ? 2 : 1;
+    int step = cpu->df ? -elem : elem;
+    int is_scas = (opcode == 0xAE || opcode == 0xAF);
+
+    while (cpu->regs.wordregs[regcx] != 0) {
+        uint16_t di = cpu->regs.wordregs[regdi];
+        uint16_t si = cpu->regs.wordregs[regsi];
+        switch (opcode) {
+        case 0xA4: case 0xA5:             /* MOVSB / MOVSW */
+            if (word) { uint16_t v = cpu_readw(cpu, dsb + si); rep_store(cpu, esb + di, (uint8_t)v, (uint8_t)(v >> 8), 1, &wlo, &whi); }
+            else      { rep_store(cpu, esb + di, cpu_read(cpu, dsb + si), 0, 0, &wlo, &whi); }
+            cpu->regs.wordregs[regsi] = (uint16_t)(si + step);
+            break;
+        case 0xAA: case 0xAB:             /* STOSB / STOSW */
+            if (word) rep_store(cpu, esb + di, cpu->regs.wordregs[regax] & 0xFF, cpu->regs.wordregs[regax] >> 8, 1, &wlo, &whi);
+            else      rep_store(cpu, esb + di, cpu->regs.byteregs[regal], 0, 0, &wlo, &whi);
+            break;
+        case 0xAE:                         /* SCASB */
+            (void)cpu_alu8(cpu, 7, cpu->regs.byteregs[regal], cpu_read(cpu, esb + di));
+            break;
+        case 0xAF:                         /* SCASW */
+            (void)cpu_alu16(cpu, 7, cpu->regs.wordregs[regax], cpu_readw(cpu, esb + di));
+            break;
+        default:
+            return 0;
+        }
+        cpu->regs.wordregs[regdi] = (uint16_t)(di + step);
+        cpu->regs.wordregs[regcx]--;
+        if (is_scas) {
+            if (reptype == 1 && !cpu->zf) break;   /* REPE stops on mismatch */
+            if (reptype == 2 && cpu->zf) break;    /* REPNE stops on match */
+        }
+    }
+    if (whi >= wlo) dynrec_invalidate_range(wlo, whi - wlo + 1);
+    cpu->ip = (uint16_t)(cpu->ip + len);
+    return 0;
 }
 
 /* ---- Register 16-bit operations ---- */
