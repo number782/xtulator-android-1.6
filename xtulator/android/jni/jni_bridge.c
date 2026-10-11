@@ -72,6 +72,8 @@ static uint64_t pit_last_dump = 0;
 #define TIMING_LOOPS_PER_SEC 150
 static uint32_t instructionsperloop = UNTHROTTLED_BATCH, cpuLimitTimer;
 static volatile uint8_t goCPU = 1, limitCPU = 0, emu_paused = 0;
+static volatile uint8_t reset_requested = 0; /* set by nativeReset(), consumed by nativeRun() */
+static void do_reset(void);
 /* Ring buffer for key scancodes (press=0x00-0x7F, release=0x80-0xFF).
  * Size must be power of 2 for fast modulo. */
 #define KEYBUF_SIZE 16
@@ -603,6 +605,16 @@ JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeRun(	JNI
 	uint32_t diag_count = 0;  /* Count how many blocks were executed natively */
 	while (running) {
 		loop_count++;
+		if (reset_requested) { reset_requested = 0; do_reset(); }
+		/* Paused (Activity in background): do NOT execute the guest. The old
+		 * check sat after cpu_exec(), so a "paused" emulator still ran a full
+		 * batch every loop and the screen froze while the guest kept going.
+		 * Sleep and skip the batch; timing_loop() catches up on resume
+		 * (catchup is capped), so the guest does not burst to make up time. */
+		if (!goCPU) {
+			usleep(20000);
+			continue;
+		}
 		cpu_interruptCheck(&machine.CPU, &machine.i8259);
 
         /* Use dynrec if available, otherwise fall back to interpreter */
@@ -709,6 +721,7 @@ JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativePause(JN
 JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeResume(JNIEnv *env, jobject thiz) {
 	(void)env; (void)thiz;
 	LOGI("nativeResume: resuming emulation");
+	android_fb_invalidate();
 	running = 1;
 	emu_paused = 0;
 	goCPU = 1;
@@ -798,8 +811,7 @@ JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetFrame
 	return result;
 }
 
-JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeReset(JNIEnv *env, jobject thiz) {
-	(void)env; (void)thiz;
+static void do_reset(void) {
 	LOGI("nativeReset: resetting emulator");
 	cpu_reset(&machine.CPU);
 	dynrec_reset();
@@ -828,6 +840,17 @@ JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeReset(JN
 	machine.CPU.totalexec = 0;
 	goCPU = 1;
 	LOGI("nativeReset: emulator reset complete");
+}
+
+/* Reset must run on the emulator thread. It used to run on the UI thread
+ * straight from the menu handler, re-initialising the PIC/PIT/UART/FDC and
+ * the timer list while the emulator thread was in the middle of using them,
+ * so a reset only "took" when the race happened to go the right way. The menu
+ * now just raises a flag; nativeRun() performs the reset between batches. */
+JNIEXPORT void JNICALL Java_com_xtulator_android_XTulatorActivity_nativeReset(JNIEnv *env, jobject thiz) {
+	(void)env; (void)thiz;
+	LOGI("nativeReset: reset requested");
+	reset_requested = 1;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_xtulator_android_XTulatorActivity_nativeChangeFloppy(JNIEnv *env, jobject thiz, jstring path) {

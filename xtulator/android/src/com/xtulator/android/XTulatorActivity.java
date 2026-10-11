@@ -569,6 +569,7 @@ public class XTulatorActivity extends Activity {
         private static final int FB_MAX_PIXELS = 1024 * 1024;
         private final XTulatorActivity mActivity;
         private volatile boolean mRunning = false;
+        private volatile int mRenderGen = 0; // identifies the live render thread
         private Thread mRenderThread;
          private Bitmap mBitmap;
          private final Object mBitmapLock = new Object();
@@ -596,10 +597,11 @@ public class XTulatorActivity extends Activity {
                 return;
             }
             mRunning = true;
+            final int gen = ++mRenderGen;
             mRenderThread = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    renderLoop();
+                    renderLoop(gen);
                 }
             });
             mRenderThread.start();
@@ -617,16 +619,21 @@ public class XTulatorActivity extends Activity {
             }
             synchronized (mBitmapLock) {
                 mBitmap = null;
+                // Forget the size too: the render loop only recreates the bitmap
+                // when the size CHANGES, so leaving these set meant a resumed
+                // activity never got a bitmap back and stayed black.
+                mFbW = 0;
+                mFbH = 0;
             }
         }
 
-        private void renderLoop() {
+        private void renderLoop(int gen) {
             int[] dims = new int[2];
             if (mPixels == null) {
                 mPixels = new int[FB_MAX_PIXELS];
             }
             int frameCount = 0;
-            while (mRunning) {
+            while (mRunning && gen == mRenderGen) { // gen: a slow-to-exit old thread must not outlive a restart
                 int copied = mActivity.nativeGetFrame(dims, mPixels);
                 int w = dims[0];
                 int h = dims[1];

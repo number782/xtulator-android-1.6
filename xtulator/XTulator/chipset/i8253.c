@@ -310,7 +310,22 @@ void i8253_init(I8253_t* i8253, I8259_t* i8259, PCSPEAKER_t* pcspeaker) {
 
 	/* The only PIT timer: raises IRQ0.  Disabled until channel 0 is programmed,
 	   and retargeted to the programmed rate by i8253_irq0_apply(). */
-	i8253->timer_id = timing_addTimer(i8253_tickCallback, (void*)(&i8253->cbdata), 18.2, TIMING_DISABLED);
+	/* i8253_init() runs again on every Reset. Registering a fresh timer each
+	   time left the previous (possibly enabled) IRQ0 timer running too, so after
+	   N resets IRQ0 fired N times as often. Reuse the one timer instead. */
+	{
+		static int pit_timer_made = 0;
+		static uint32_t pit_timer_id = 0;
+		if (!pit_timer_made) {
+			pit_timer_id = timing_addTimer(i8253_tickCallback, (void*)(&i8253->cbdata), 18.2, TIMING_DISABLED);
+			pit_timer_made = 1;
+		}
+		else {
+			timing_timerDisable(pit_timer_id);
+			timing_updateIntervalFreq(pit_timer_id, 18.2);
+		}
+		i8253->timer_id = pit_timer_id;
+	}
 	timing_setCatchup(i8253->timer_id, 2);
 
 	ports_cbRegister(0x40, 4, (void*)i8253_read, NULL, (void*)i8253_write, NULL, i8253);

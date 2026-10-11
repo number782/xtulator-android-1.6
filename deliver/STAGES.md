@@ -1,0 +1,2405 @@
+# XTulator Android port: staged changes
+
+Nine stages, ordered so each builds and boots on its own. Apply in order: `patch -p1 < patches/stageN.patch` from the project root (the directory containing `XTulator/` and `android/`), or re-type the diffs below. `final_files/` holds the complete final version of every changed file.
+
+Base for all patches is **your original zip**. A parallel `test_only_virtual_clock.patch` (virtual clock in `timing.c`) exists only for my host test harness; do not apply it to the app.
+
+## Measured results (ARM build under qemu-user, 40M guest instructions, interpreter unless noted)
+
+qemu timings are a **relative proxy**, not IS01 wall-clock. I could not build the `.so`/APK or run on a device here, so nothing below is verified on the phone, and the Java changes are uncompiled.
+
+| After stage | Boots to `A:\>` | IRQ0 count | Wall (s) |
+|---|---|---|---|
+| 0 (original) | yes (harness only) | 100,000 | 18.9 |
+| 1 Java | yes | 99,998 | 20.1 |
+| 2 PIT | yes | 2,184 | 18.9 |
+| 3 fast timers | yes | 2,184 | **9.3** |
+| 4 logging/guard | yes | 2,184 | 9.5 |
+| 5 VGA | yes | 2,184 | 9.4 |
+| 6 batch/frame skip | yes | 2,184 | 9.4 |
+| 7 memory pages | yes | 2,184 | 9.2 |
+| 8-9 dynrec (interpreter) | yes | 2,184 | 8.8 |
+
+Dynarec (same 40M instructions): original and stages up to 7 crash in the first helper call; stage 8 runs but takes 140 s; stage 9 takes 14.5 s.
+
+Caveat on the "original boots" row: the host harness uses a virtual clock (3 us per guest instruction) and neutralises the stale-callback guard, so it cannot reproduce the device hang that depends on real wall-time and timer catch-up. The IRQ0 count (a 45x reduction) and the stage 3 halving are the real signals; the VGA, batch and frame-skip savings land in the render thread/UI and show up in `vga_test`, not in this table.
+
+## SDL
+
+Not recommended. The bottleneck was never the blit API (it was timers, redraw rate and the CPU core), Android 1.6 has no `ANativeWindow`, and SDL would not add a measurable speedup. If the Java `setPixels` copy ever measures as significant, a `GLSurfaceView` texture upload is the next thing to try.
+
+## Caveats
+- `XT_ENABLE_AUDIO` is still 0. If you re-enable it, PC speaker pitch will be coarse because `timing_cur` is stale within a batch.
+- Rebuild with `build.sh`/`build-apk.sh`. Watch for compile errors in the Java hunk (stage 1 uses `prefs`, which exists in that method).
+
+---
+## Stage 1: Java: stop forcing traces and dynrec on
+
+**Files:** `XTulatorActivity.java`
+
+`restoreTraceSettings()` hard-wired `mTraceMisc/mTraceCpu/mTraceInterrupts = true`, `TRACE_DIAG` on, and `mDynrecEnabled = true` on **every launch**, overriding the menu toggles and saved prefs. CPU/MISC/INTERRUPT tracing is a `logd` write every few dozen instructions, which starves a 528 MHz single core, and it also forced the 15x-slow dynarec on. Your diagnostics are kept: the menu toggles and prefs now drive the flags, and `FORCE_DEBUG_TRACES = true` restores the old always-on behaviour for a diagnostic build. The "show CPU speed" overlay and the DR toggle are untouched.
+
+**Verification:** Interpreter-only change. Install, confirm the menu DR toggle and trace toggles now persist across launches.
+
+```diff
+--- a/android/src/com/xtulator/android/XTulatorActivity.java
++++ b/android/src/com/xtulator/android/XTulatorActivity.java
+@@ -260,17 +260,27 @@
+         mTraceKeyboard = prefs.getBoolean("trace_keyboard", false);
+         mTraceInterrupts = prefs.getBoolean("trace_interrupts", false);
+         mTraceDisk = prefs.getBoolean("trace_disk", false);
+-        mTraceMisc = true;
+-        mTraceCpu = true;
+-        mTraceInterrupts = true;
+-        nativeSetTraceFlag(TRACE_MISC, true);
+-        nativeSetTraceFlag(TRACE_CPU, true);
+-        nativeSetTraceFlag(TRACE_INTERRUPTS, true);
+-        mTraceDiag = false;
+-        nativeSetTraceFlag(TRACE_DIAG, true);
++        /*
++         * Trace flags and the dynrec switch used to be hard-wired ON here,
++         * overriding the menu toggles and saved prefs on every launch. CPU/MISC/
++         * INTERRUPT tracing costs a logd write every few dozen emulated
++         * instructions, which on this device starves the emulation. They now follow
++         * the menu / saved prefs (default off). Set FORCE_DEBUG_TRACES to true to
++         * get the old always-on behaviour for a diagnostic build.
++         */
++        final boolean FORCE_DEBUG_TRACES = false;
++        mTraceMisc = FORCE_DEBUG_TRACES || prefs.getBoolean("trace_misc", false);
++        mTraceDiag = prefs.getBoolean("trace_diag", false);
++        if (FORCE_DEBUG_TRACES) { mTraceCpu = true; mTraceInterrupts = true; }
++        nativeSetTraceFlag(TRACE_MISC, mTraceMisc);
++        nativeSetTraceFlag(TRACE_CPU, mTraceCpu);
++        nativeSetTraceFlag(TRACE_KEYBOARD, mTraceKeyboard);
++        nativeSetTraceFlag(TRACE_INTERRUPTS, mTraceInterrupts);
++        nativeSetTraceFlag(TRACE_DISK, mTraceDisk);
++        nativeSetTraceFlag(TRACE_DIAG, mTraceDiag);
+         nativeSetTraceFlag(TRACE_VIDEO, false);
+-        mDynrecEnabled = true;
+-        nativeEnableDynrec(true);
++        mDynrecEnabled = prefs.getBoolean("dynrec", false);
++        nativeEnableDynrec(mDynrecEnabled);
+         Log.i("XTulator", "Restored trace settings: cpu=" + mTraceCpu + " keyboard=" + mTraceKeyboard
+               + " interrupts=" + mTraceInterrupts + " disk=" + mTraceDisk + " misc=" + mTraceMisc
+               + " diag=" + mTraceDiag
+```
+
+## Stage 2: PIT (i8253) rewrite + keyboard/PPI restore
+
+**Files:** `chipset/i8253.c/.h`, `chipset/i8255.c/.h`, `modules/audio/pcspeaker.c`
+
+**This is the boot fix.** The modified PIT ticked channel 0 from a fast timer and the keyboard controller had been replaced by a fake 8042 with a different self-test sequence; my diagnosis (not reproducible in the host harness, which has a virtual clock) is that the BIOS stalls at the initial screen because of the timer rate plus the keyboard self-test handshake. Changes:
+- PIT is now *lazy*: the counter value is computed from `timing_cur` and the 1.193182 MHz clock when the guest reads it. Only one timer exists (IRQ0), at `1193182/reload` Hz, clamped to 2000 Hz. All six modes' counter values are computed (mode 3 square wave drives the speaker output). Latch command and separate LSB/MSB read/write flip-flops are handled.
+- `i8255.c` restored to upstream behaviour: port 0x61 read toggles the refresh bit (bit 4) on each read, instead of a timer; the 0xAA keyboard self-test reply is restored (write 0x60 -> 0xAA; portB bit 6 0->1 -> 0xAA).
+- `pcspeaker.c` reads the PIT channel 2 output through the new `i8253_getOut2()`, and its 48 kHz timer is only registered if `XT_ENABLE_AUDIO` (currently 0).
+
+**Because `i8253.c` is a rewrite, a diff is hard to read - use the full file in `final_files/XTulator/chipset/i8253.c` (and `.h`) and replace yours.** The diff is included below for completeness.
+
+**Verification:** Host harness: IRQ0 count over 40M guest instructions fell from 100,000 to 2,184 and the BIOS tick counter now advances at ~18.2 Hz of guest time. Boots to `A:\>` in both engines.
+
+```diff
+--- a/XTulator/chipset/i8253.c
++++ b/XTulator/chipset/i8253.c
+@@ -18,7 +18,26 @@
+ */
+ 
+ /*
+-	Intel 8253 timer
++	Intel 8253 timer -- lazy model.
++
++	The upstream core ticks every channel from a 48 kHz timer. That is ~48k
++	callbacks per emulated second, which a 528 MHz ARM9 cannot afford.  The port
++	then replaced it with a timer whose "frequency" argument was really a period
++	(1000000/18.2 = 54945 Hz), which made IRQ0 fire at ~27 kHz and ignored what
++	the BIOS programmed into the counters.
++
++	This version never ticks.  A counter's value is *computed on demand* from the
++	host time elapsed since it was loaded (the PIT input clock is 1.193182 MHz),
++	so reads are exact and cost nothing when nobody reads them.  The only timer is
++	one that raises IRQ0 at the rate channel 0 was programmed for.  The IRQ0 rate
++	follows the BIOS/game programming (18.2 Hz by default) and is clamped to
++	PIT_IRQ_MAX_HZ, because the guest cannot service interrupts faster than that
++	on this hardware anyway (and the 8259 IRR is a latch, so extra edges would be
++	merged).
++
++	Time base: timing_cur, the clock sample timing_loop() already took.  It is at
++	most one batch of instructions stale, which avoids a clock_gettime() syscall
++	per port read.
+ */
+ 
+ #include <stdio.h>
+@@ -39,16 +58,13 @@
+ #define I8253_LOGI(...)
+ #endif
+ 
++#define PIT_CLOCK_HZ		1193182ULL
++#define PIT_IRQ_MAX_HZ		2000.0
++
+ uint32_t i8253_timers[3];
+ 
+-/*
+-	Diagnostic: how often channel 0 actually raises IRQ0, and what the BIOS
+-	programmed it to. INT 8 (the BIOS timer tick at 0040:006C) is the single
+-	hottest routine in the whole emulator, so if this rate is far above the
+-	~18.2Hz the BIOS expects, the PIT model is the problem.
+-*/
+-uint64_t i8253_irq0_count = 0;
+ static I8253_t* i8253_diag_inst = NULL;
++uint64_t i8253_irq0_count = 0;
+ 
+ void i8253_debugReset(void) {
+ 	i8253_irq0_count = 0;
+@@ -60,14 +76,109 @@
+ 		DIAG("PIT: no instance");
+ 		return;
+ 	}
+-	DIAG("PIT: IRQ0=%llu in %llums -> %.2f Hz (BIOS expects ~18.2Hz); ch0 reload=%u mode=%u counter=%u active=%u",
++	DIAG("PIT: IRQ0=%llu in %llums -> %.2f Hz (BIOS expects ~18.2Hz); ch0 reload=%d mode=%u active=%u",
+ 		(unsigned long long)i8253_irq0_count,
+ 		(unsigned long long)(host_us / 1000),
+ 		host_us ? ((double)i8253_irq0_count * 1000000.0 / (double)host_us) : 0.0,
+-		i8253->reload[0], i8253->mode[0], i8253->counter[0], i8253->active[0]);
++		(int)i8253->reload[0], i8253->mode[0], i8253->active[0]);
+ 	i8253_irq0_count = 0;
+ }
+ 
++/* Number of PIT input clocks since the counter was loaded. */
++static uint64_t i8253_elapsed(I8253_t* i8253, uint8_t ch) {
++	uint64_t dt = timing_cur - i8253->loadtime[ch];
++	if (timing_cur < i8253->loadtime[ch]) return 0;
++	return (dt * PIT_CLOCK_HZ) / 1000000ULL;
++}
++
++static uint32_t i8253_reloadval(I8253_t* i8253, uint8_t ch) {
++	uint32_t r = (uint32_t)i8253->reload[ch];
++	return (r == 0) ? 65536 : r;
++}
++
++/* Current counter value, as the hardware would show it. */
++static uint16_t i8253_count(I8253_t* i8253, uint8_t ch) {
++	uint64_t t;
++	uint32_t r, v;
++
++	if (!i8253->active[ch]) return (uint16_t)i8253->counter[ch];
++	t = i8253_elapsed(i8253, ch);
++	r = i8253_reloadval(i8253, ch);
++	switch (i8253->mode[ch]) {
++	case 2: //rate generator: r..1 repeating
++		v = r - (uint32_t)(t % r);
++		break;
++	case 3: //square wave: counts down by two, so a full period is r input clocks
++		v = r - (uint32_t)((2 * (t % r)) % r);
++		break;
++	default: //mode 0/1/4/5: counts down once, then wraps
++		v = (uint32_t)((r - (t & 0xFFFF)) & 0xFFFF);
++		break;
++	}
++	return (uint16_t)v;
++}
++
++/* Output pin of a channel, derived from time. */
++static uint8_t i8253_outpin(I8253_t* i8253, uint8_t ch) {
++	uint64_t t;
++	uint32_t r;
++
++	if (!i8253->active[ch]) return i8253->out[ch];
++	t = i8253_elapsed(i8253, ch);
++	r = i8253_reloadval(i8253, ch);
++	switch (i8253->mode[ch]) {
++	case 0:
++		return (t >= r) ? 1 : 0;
++	case 2:
++		return ((t % r) == (r - 1)) ? 0 : 1;
++	case 3:
++		return ((t % r) < ((r + 1) / 2)) ? 1 : 0;
++	}
++	return i8253->out[ch];
++}
++
++uint8_t i8253_getOut2(void) {
++	if (i8253_diag_inst == NULL) return 0;
++	return i8253_outpin(i8253_diag_inst, 2);
++}
++
++static void i8253_irq0_apply(I8253_t* i8253) {
++	/* (Re)program the IRQ0 timer from channel 0's current mode and reload. */
++	double hz;
++	uint32_t r;
++
++	if (!i8253->active[0] || (i8253->mode[0] != 2 && i8253->mode[0] != 3 && i8253->mode[0] != 0)) {
++		timing_timerDisable(i8253->timer_id);
++		return;
++	}
++	r = i8253_reloadval(i8253, 0);
++	hz = (double)PIT_CLOCK_HZ / (double)r;
++	if (hz > PIT_IRQ_MAX_HZ) hz = PIT_IRQ_MAX_HZ;
++	timing_updateIntervalFreq(i8253->timer_id, hz);
++	timing_timerEnable(i8253->timer_id); //also restarts the interval from "now"
++}
++
++void i8253_timerCallback0(I8259_t* i8259) {
++	I8253_LOGI("i8253_timerCallback0: raising IRQ0");
++	i8253_irq0_count++;
++	i8259_doirq(i8259, 0);
++}
++
++void i8253_timerCallback1(I8259_t* i8259) {
++}
++
++void i8253_timerCallback2(I8259_t* i8259) {
++}
++
++void i8253_tickCallback(I8253CB_t* i8253cb) {
++	I8253_t* i8253 = (I8253_t*)i8253cb->i8253;
++	i8253_timerCallback0(i8253cb->i8259);
++	if (i8253->mode[0] == 0) { //interrupt on terminal count: one shot
++		i8253->out[0] = 1;
++		timing_timerDisable(i8253->timer_id);
++	}
++}
++
+ void i8253_write(I8253_t* i8253, uint16_t portnum, uint8_t value) {
+ 	uint8_t sel, rl, loaded;
+ 	portnum &= 3;
+@@ -80,51 +191,57 @@
+ 		switch (i8253->rlmode[portnum]) {
+ 		case 1: //MSB only
+ 			i8253->reload[portnum] = (int32_t)value << 8;
+-			i8253->active[portnum] = 1;
+ 			loaded = 1;
+ 			break;
+ 		case 2: //LSB only
+ 			i8253->reload[portnum] = value;
+-			i8253->active[portnum] = 1;
+ 			loaded = 1;
+ 			break;
+ 		case 3: //LSB, then MSB
+-			if (i8253->dataflipflop[portnum] == 0) { //LSB
++			if (i8253->wff[portnum] == 0) { //LSB
+ 				i8253->reload[portnum] = (i8253->reload[portnum] & 0xFF00) | value;
+ 			} else { //MSB
+ 				i8253->reload[portnum] = (i8253->reload[portnum] & 0x00FF) | ((int32_t)value << 8);
+-				i8253->counter[portnum] = i8253->reload[portnum];
+-				if (i8253->reload[portnum] == 0) {
+-					i8253->reload[portnum] = 65536;
+-				}
+-				i8253->active[portnum] = 1;
+ 				loaded = 1;
+-#ifdef DEBUG_PIT
+-				debug_log(DEBUG_DETAIL, "I8253: Counter %u reload = %d\r\n", portnum, i8253->reload[portnum]);
+-#endif
+ 			}
+-			i8253->dataflipflop[portnum] ^= 1;
++			i8253->wff[portnum] ^= 1;
+ 			break;
+ 		}
+-		if (loaded) switch (i8253->mode[portnum]) {
+-		case 0:
+-		case 1:
+-			i8253->out[portnum] = 0;
+-			break;
+-		case 2:
+-		case 3:
+-			i8253->out[portnum] = 1;
+-			break;
++		if (loaded) {
++			if (i8253->reload[portnum] == 0) {
++				i8253->reload[portnum] = 65536;
++			}
++			i8253->counter[portnum] = i8253->reload[portnum];
++			i8253->active[portnum] = 1;
++			i8253->loadtime[portnum] = timing_cur;
++			switch (i8253->mode[portnum]) {
++			case 0:
++			case 1:
++				i8253->out[portnum] = 0;
++				break;
++			case 2:
++			case 3:
++				i8253->out[portnum] = 1;
++				break;
++			}
++#ifdef DEBUG_PIT
++			debug_log(DEBUG_DETAIL, "I8253: Counter %u reload = %d\r\n", portnum, i8253->reload[portnum]);
++#endif
++			if (portnum == 0) i8253_irq0_apply(i8253);
+ 		}
+ 		break;
+ 	case 3: //control word
+ 		sel = value >> 6;
+-		if (sel == 3) { //illegal
++		if (sel == 3) { //illegal (8254 read-back, not on the 8253)
+ 			return;
+ 		}
+ 		rl = (value >> 4) & 3; //read/load mode
+ 		if (rl == 0) { //counter latching operation
+-			i8253->latch[sel] = i8253->counter[sel];
++			if (!i8253->latched[sel]) {
++				i8253->latch[sel] = i8253_count(i8253, sel);
++				i8253->latched[sel] = 1;
++				i8253->rff[sel] = 0;
++			}
+ 		} else { //set mode
+ 			i8253->rlmode[sel] = rl;
+ 			i8253->mode[sel] = (value >> 1) & 7;
+@@ -132,11 +249,15 @@
+ 				i8253->mode[sel] &= 3; //MSB is "don't care" if bit 1 is set
+ 			}
+ 			i8253->bcd[sel] = value & 1;
++			i8253->wff[sel] = 0;
++			i8253->rff[sel] = 0;
++			i8253->latched[sel] = 0;
++			i8253->active[sel] = 0; //a new mode waits for a new count to be loaded
++			if (sel == 0) timing_timerDisable(i8253->timer_id);
+ #ifdef DEBUG_PIT
+ 			debug_log(DEBUG_DETAIL, "I8253: Counter %u mode = %u\r\n", sel, i8253->mode[sel]);
+ #endif
+ 		}
+-		i8253->dataflipflop[sel] = 0;
+ 		break;
+ 	}
+ }
+@@ -149,73 +270,35 @@
+ 		return 0xFF; //no read of control word possible
+ 	}
+ 
++	/* No latch pending: sample the live count (what the hardware does when
++	   software reads a counter without latching it first). */
++	if (!i8253->latched[portnum]) {
++		i8253->latch[portnum] = i8253_count(i8253, portnum);
++	}
++
+ 	switch (i8253->rlmode[portnum]) {
+ 	case 1: //MSB only
+-		return i8253->latch[portnum] >> 8;
++		ret = i8253->latch[portnum] >> 8;
++		i8253->latched[portnum] = 0;
++		return ret;
+ 	case 2: //LSB only
+-		return (uint8_t)i8253->latch[portnum];
+-	default: //LSB, then MSB (case 3, but say default so MSVC stops warning me about control paths not all returning a value)
+-		if (i8253->dataflipflop[portnum] == 0) { //LSB
++		ret = (uint8_t)i8253->latch[portnum];
++		i8253->latched[portnum] = 0;
++		return ret;
++	default: //LSB, then MSB
++		if (i8253->rff[portnum] == 0) { //LSB
+ 			ret = (uint8_t)i8253->latch[portnum];
++			i8253->rff[portnum] = 1;
++			i8253->latched[portnum] = 1; //hold the value so the MSB belongs to the same sample
+ 		} else { //MSB
+ 			ret = i8253->latch[portnum] >> 8;
++			i8253->rff[portnum] = 0;
++			i8253->latched[portnum] = 0;
+ 		}
+ 		return ret;
+ 	}
+ }
+ 
+-void i8253_timerCallback0(I8259_t* i8259) {
+-    I8253_LOGI("i8253_timerCallback0: raising IRQ0");
+-	i8253_irq0_count++;
+-	i8259_doirq(i8259, 0);
+-}
+-
+-void i8253_timerCallback1(I8259_t* i8259) {
+-}
+-
+-void i8253_timerCallback2(I8259_t* i8259) {
+-}
+-
+-void i8253_tickCallback(I8253CB_t* i8253cb) {
+-    I8253_LOGI("i8253_tickCallback: called");
+-	I8253_t* i8253;
+-	I8259_t* i8259;
+-	uint8_t i;
+-
+-	i8253 = i8253cb->i8253;
+-	i8259 = i8253cb->i8259;
+-	for (i = 0; i < 3; i++) {
+-		if ((i == 2) && (i8253->mode[2] != 3)) pcspeaker_setGateState(i8253->cbdata.pcspeaker, PC_SPEAKER_GATE_TIMER2, 0);
+-		if (i8253->active[i]) switch (i8253->mode[i]) {
+-		case 0: //interrupt on terminal count
+-			if (i8253->counter[i] > 0) {
+-				i8253->counter[i] = 0;
+-				i8253->out[i] = 1;
+-				if (i == 0) i8253_timerCallback0(i8259);
+-			}
+-			break;
+-		case 2: //rate generator
+-			i8253->out[i] ^= 1;
+-			if (i == 0) i8253_timerCallback0(i8259);
+-			i8253->counter[i] = i8253->reload[i];
+-			break;
+-		case 3: //square wave generator
+-			i8253->out[i] ^= 1;
+-			if (i8253->out[i] == 0) {
+-				if (i == 0) i8253_timerCallback0(i8259);
+-			}
+-			if (i == 2) pcspeaker_setGateState(i8253->cbdata.pcspeaker, PC_SPEAKER_GATE_TIMER2, i8253->out[i]);
+-			i8253->counter[i] = i8253->reload[i];
+-			break;
+-		default:
+-#ifdef DEBUG_PIT
+-			debug_log(DEBUG_DETAIL, "I8253: Unknown mode %u on counter %u\r\n", i8253->mode[i], i);
+-#endif
+-			break;
+-		}
+-	}
+-}
+-
+ void i8253_init(I8253_t* i8253, I8259_t* i8259, PCSPEAKER_t* pcspeaker) {
+ 	memset(i8253, 0, sizeof(I8253_t));
+ 
+@@ -225,8 +308,10 @@
+ 	i8253->cbdata.i8259 = i8259;
+ 	i8253->cbdata.pcspeaker = pcspeaker;
+ 
+-	i8253->timer_id = timing_addTimer(i8253_tickCallback, (void*)(&i8253->cbdata), 1000000.0 / 18.2, TIMING_ENABLED); // 18.2 Hz timer tick
+-	timing_setCatchup(i8253->timer_id, 5);
++	/* The only PIT timer: raises IRQ0.  Disabled until channel 0 is programmed,
++	   and retargeted to the programmed rate by i8253_irq0_apply(). */
++	i8253->timer_id = timing_addTimer(i8253_tickCallback, (void*)(&i8253->cbdata), 18.2, TIMING_DISABLED);
++	timing_setCatchup(i8253->timer_id, 2);
+ 
+ 	ports_cbRegister(0x40, 4, (void*)i8253_read, NULL, (void*)i8253_write, NULL, i8253);
+ }
+--- a/XTulator/chipset/i8253.h
++++ b/XTulator/chipset/i8253.h
+@@ -21,7 +21,6 @@
+ #define _I8253_H_
+ 
+ #include <stdint.h>
+-#include <stdint.h>
+ #include "i8259.h"
+ 
+ extern uint64_t i8253_irq0_count;
+@@ -58,10 +57,16 @@
+ 	uint8_t out[3];
+ 	I8253CB_t cbdata;
+ 	uint32_t timer_id;
++	/* Lazy (time-derived) counter model -- see i8253.c */
++	uint64_t loadtime[3];     /* host time (us) at which the counter was last (re)loaded */
++	uint8_t wff[3];           /* write flip-flop (LSB/MSB) */
++	uint8_t rff[3];           /* read flip-flop (LSB/MSB) */
++	uint8_t latched[3];       /* a latched value is waiting to be read */
+ } I8253_t;
+ 
+ void i8253_write(I8253_t* i8253, uint16_t portnum, uint8_t value);
+ uint8_t i8253_read(I8253_t* i8253, uint16_t portnum);
+ void i8253_init(I8253_t* i8253, I8259_t* i8259, PCSPEAKER_t* pcspeaker);
++uint8_t i8253_getOut2(void);
+ 
+ #endif
+--- a/XTulator/chipset/i8255.c
++++ b/XTulator/chipset/i8255.c
+@@ -33,138 +33,28 @@
+ #include "../ports.h"
+ #include "../debuglog.h"
+ 
+-#ifdef __ANDROID__
+-#include <android/log.h>
+-#define LOGKEY(...) do { if (trace_flags & TRACE_FLAG_KEYBOARD) { __android_log_print(ANDROID_LOG_INFO, "XTulator-KEY", __VA_ARGS__); } } while (0)
+-#else
+-#define LOGKEY(...)
+-#endif
+-
+-static void kbc_process_command(I8255_t* i8255, uint8_t cmd) {
+-#ifdef DEBUG_PPI
+-	debug_log(DEBUG_INFO, "[KBC] Command: %02X\r\n", cmd);
+-#endif
+-	switch (cmd) {
+-	case 0xAA:
+-		i8255->kbc_response = 0x55;
+-		i8255->kbc_has_response = 1;
+-		i8255->kbc_status |= 0x01;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Self-test passed, response=55\r\n");
+-#endif
+-		break;
+-	case 0xAB:
+-		i8255->kbc_response = 0x00;
+-		i8255->kbc_has_response = 1;
+-		i8255->kbc_status |= 0x01;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Interface test\r\n");
+-#endif
+-		break;
+-	case 0xAD:
+-		i8255->kbc_status |= 0x10;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Disable keyboard interface\r\n");
+-#endif
+-		break;
+-	case 0xAE:
+-		i8255->kbc_status &= ~0x10;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Enable keyboard interface\r\n");
+-#endif
+-		break;
+-	case 0xC0:
+-		i8255->kbc_response = i8255->kbc_status;
+-		i8255->kbc_has_response = 1;
+-		i8255->kbc_status |= 0x01;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Read input port\r\n");
+-#endif
+-		break;
+-	case 0xD0:
+-		i8255->kbc_response = i8255->kbc_status & 0xF0;
+-		i8255->kbc_has_response = 1;
+-		i8255->kbc_status |= 0x01;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Read output port\r\n");
+-#endif
+-		break;
+-	case 0xE0:
+-		i8255->kbc_expect_data = 1;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Read test inputs\r\n");
+-#endif
+-		break;
+-	case 0xF0:
+-	case 0xF1:
+-	case 0xF2:
+-	case 0xF3:
+-	case 0xF4:
+-	case 0xF5:
+-	case 0xF6:
+-	case 0xF7:
+-	case 0xF8:
+-	case 0xF9:
+-	case 0xFA:
+-	case 0xFB:
+-	case 0xFC:
+-	case 0xFD:
+-	case 0xFE:
+-	case 0xFF:
+-		i8255->kbc_expect_data = 1;
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Pulse output bit %u\r\n", cmd & 0x0F);
+-#endif
+-		break;
+-	default:
+-#ifdef DEBUG_PPI
+-		debug_log(DEBUG_INFO, "[KBC] Unknown command: %02X\r\n", cmd);
+-#endif
+-		break;
+-	}
+-}
+-
+ uint8_t i8255_readport(I8255_t* i8255, uint16_t portnum) {
+ #ifdef DEBUG_PPI
+-	debug_log(DEBUG_INFO, "[I8255] Read port %02X\r\n", portnum);
++	debug_log(DEBUG_DETAIL, "[I8255] Read port %02X\r\n", portnum);
+ #endif
+ 	portnum &= 7;
+ 	switch (portnum) {
+ 	case 0:
+-		LOGKEY("i8255_readport: port 0x60 read, kbc_has_response=%d isNew=%d", i8255->kbc_has_response, i8255->keystate->isNew);
+-		if (i8255->kbc_has_response) {
+-			uint8_t response = i8255->kbc_response;
+-			i8255->kbc_has_response = 0;
+-			i8255->kbc_status &= ~0x01;
+-#ifdef DEBUG_PPI
+-			debug_log(DEBUG_INFO, "[KBC] Port 60 read response: %02X\r\n", response);
+-#endif
+-			LOGKEY("i8255_readport: returning KBC response 0x%02X", response);
+-			return response;
+-		}
+-		if (i8255->keystate->isNew) {
+-			uint8_t sc = i8255->keystate->scancode;
+-			i8255->keystate->isNew = 0;
+-#ifdef DEBUG_PPI
+-			debug_log(DEBUG_INFO, "[I8255] Port 60 read: scancode=%02X\r\n", sc);
+-#endif
+-			LOGKEY("i8255_readport: returning scancode 0x%02X", sc);
+-			return sc;
+-		}
+-		LOGKEY("i8255_readport: port 0x60 read, no data, returning 0xFF");
+-		return 0xFF;
++		return i8255->keystate->scancode;
+ 	case 1:
++		/* Bit 4 is the DRAM refresh toggle that many BIOSes spin on. It used to
++		   be flipped by a 66.7 kHz timer (15us); on a slow host that meant tens
++		   of thousands of callbacks per second just to wiggle one bit. Flipping
++		   it on every read gives the same "it changed" behaviour for free. */
++		i8255->portB ^= 0x10;
+ 		return i8255->portB;
+ 	case 2:
++		//debug_log(DEBUG_DETAIL, "read 0x62\r\n");
+ 		if (i8255->portB & 8) {
+ 			return i8255->sw2 >> 4;
+ 		} else {
+ 			return i8255->sw2 & 0x0F;
+ 		}
+-	case 4:
+-		return (i8255->kbc_has_response || i8255->keystate->isNew) ? 0x01 : 0x00;
+-	case 5:
+-		return i8255->kbc_status;
+ 	}
+ 	return 0xFF;
+ }
+@@ -176,17 +66,7 @@
+ 	portnum &= 7;
+ 	switch (portnum) {
+ 	case 0:
+-		if (i8255->kbc_expect_data) {
+-#ifdef DEBUG_PPI
+-			debug_log(DEBUG_INFO, "[KBC] Data for command: %02X\r\n", value);
+-#endif
+-			i8255->kbc_expect_data = 0;
+-		} else {
+-			i8255->keystate->scancode = value;
+-#ifdef DEBUG_PPI
+-			debug_log(DEBUG_INFO, "[KBC] Port 60 write (to keyboard): %02X\r\n", value);
+-#endif
+-		}
++		i8255->keystate->scancode = 0xAA;
+ 		break;
+ 	case 1:
+ 		if (value & 0x01) {
+@@ -212,21 +92,17 @@
+ 		}
+ 		i8255->portB = (value & 0xEF) | (i8255->portB & 0x10);
+ 		break;
+-	case 4:
+-		kbc_process_command(i8255, value);
+-		break;
+ 	}
+ }
+ 
+ void i8255_refreshToggle(I8255_t* i8255) {
+-	i8255->portB ^= 0x10;
++	i8255->portB ^= 0x10; //simulate DRAM refresh toggle, many BIOSes require this...
+ }
+ 
+ void i8255_init(I8255_t* i8255, KEYSTATE_t* keystate, PCSPEAKER_t* pcspeaker) {
+ 	memset(i8255, 0, sizeof(I8255_t));
+ 	i8255->keystate = keystate;
+ 	i8255->pcspeaker = pcspeaker;
+-	i8255->kbc_status = 0x10;
+ 
+ 	if (videocard == VIDEO_CARD_VGA) {
+ 		i8255->sw2 = 0x46;
+@@ -236,5 +112,4 @@
+ 	}
+ 
+ 	ports_cbRegister(0x60, 6, (void*)i8255_readport, NULL, (void*)i8255_writeport, NULL, i8255);
+-	timing_addTimer(i8255_refreshToggle, i8255, 66667, TIMING_ENABLED);
+-}
+\ No newline at end of file
++}
+--- a/XTulator/chipset/i8255.h
++++ b/XTulator/chipset/i8255.h
+@@ -12,14 +12,6 @@
+ 	uint8_t portC;
+ 	KEYSTATE_t* keystate;
+ 	PCSPEAKER_t* pcspeaker;
+-	// Keyboard controller (8042) emulation
+-	uint8_t kbc_status;       // Port 0x64 status register
+-	uint8_t kbc_data;         // Port 0x60 data register (output buffer)
+-	uint8_t kbc_command;      // Last command written to port 0x64
+-	uint8_t kbc_wait_response; // Waiting for response after command
+-	uint8_t kbc_response;     // Response byte for KBC commands
+-	uint8_t kbc_has_response; // Flag indicating response is ready
+-	uint8_t kbc_expect_data;  // Flag expecting data byte after command
+ } I8255_t;
+ 
+ uint8_t i8255_readport(I8255_t* i8255, uint16_t portnum);
+--- a/XTulator/modules/audio/pcspeaker.c
++++ b/XTulator/modules/audio/pcspeaker.c
+@@ -34,7 +34,7 @@
+ 
+ void pcspeaker_callback(PCSPEAKER_t* spk) {
+ 	if (spk->pcspeaker_gateSelect == PC_SPEAKER_USE_TIMER2) {
+-		if (spk->pcspeaker_gate[PC_SPEAKER_GATE_TIMER2] && spk->pcspeaker_gate[PC_SPEAKER_GATE_DIRECT]) {
++		if (i8253_getOut2() && spk->pcspeaker_gate[PC_SPEAKER_GATE_DIRECT]) {
+ 			if (spk->pcspeaker_amplitude < 15000) {
+ 				spk->pcspeaker_amplitude += PC_SPEAKER_MOVEMENT;
+ 			}
+@@ -65,7 +65,10 @@
+ void pcspeaker_init(PCSPEAKER_t* spk) {
+ 	memset(spk, 0, sizeof(PCSPEAKER_t));
+ 	spk->pcspeaker_gateSelect = PC_SPEAKER_GATE_DIRECT;
++#if XT_ENABLE_AUDIO
++	/* 48 kHz callback: only worth its cost when something consumes the samples. */
+ 	timing_addTimer(pcspeaker_callback, spk, SAMPLE_RATE, TIMING_ENABLED);
++#endif
+ }
+ 
+ int16_t pcspeaker_getSample(PCSPEAKER_t* spk) {
+```
+
+## Stage 3: Remove the fast timers
+
+**Files:** `config.h`, `machine.c`, `timing.h`, `modules/video/vga.c`, `modules/video/vga.h`
+
+Three timers fired thousands of times a second just to wiggle a bit:
+- VGA hblank + hblank-end timers (~31 kHz x 2) existed only to toggle port 0x3DA bits. Port 0x3DA is now computed from the clock at read time by `vga_status1_now()`.
+- Serial mouse byte poll ran at baud/9 = 12.8 kHz; now `MOUSE_POLL_HZ` = 1000.
+- `TIMING_CATCHUP_DEFAULT` 4096 -> 4: after a stall the timer loop used to replay up to 4096 missed ticks in a burst (a timer storm). Now at most 4.
+
+**Verification:** Interpreter, 40M guest instructions, ARM/qemu: **18.9 s -> 9.3 s** (2x). Still boots to `A:\>`.
+
+```diff
+--- a/XTulator/config.h
++++ b/XTulator/config.h
+@@ -70,6 +70,13 @@
+ */
+ #define XT_ENABLE_AUDIO 0
+ 
++/*
++	Serial mouse byte poll rate. Was baudrate/9 = 12.8 kHz, i.e. 12,800 timer
++	callbacks a second to move bytes that arrive at ~130 bytes/s on a 1200 baud
++	Microsoft mouse.
++*/
++#define MOUSE_POLL_HZ 1000.0
++
+ extern volatile uint8_t running;
+ extern uint8_t videocard, showMIPS;
+ extern double speedarg;
+--- a/XTulator/machine.c
++++ b/XTulator/machine.c
+@@ -220,7 +220,7 @@
+         MACHINE_LOGI("generic_xt: after uart_init UART0_MOUSE");
+ 		mouse_init(&machine->UART[0]);
+         MACHINE_LOGI("generic_xt: after mouse_init");
+-		timing_addTimer(mouse_rxpoll, NULL, baudrate / 9, TIMING_ENABLED);
++		timing_addTimer(mouse_rxpoll, NULL, MOUSE_POLL_HZ, TIMING_ENABLED);
+         MACHINE_LOGI("generic_xt: after timing_addTimer");
+ 	}
+ #ifdef ENABLE_TCP_MODEM
+@@ -250,7 +250,7 @@
+         MACHINE_LOGI("generic_xt: after uart_init UART1_MOUSE");
+ 		mouse_init(&machine->UART[1]);
+         MACHINE_LOGI("generic_xt: after mouse_init");
+-		timing_addTimer(mouse_rxpoll, NULL, baudrate / 9, TIMING_ENABLED);
++		timing_addTimer(mouse_rxpoll, NULL, MOUSE_POLL_HZ, TIMING_ENABLED);
+         MACHINE_LOGI("generic_xt: after timing_addTimer");
+ 	}
+ #ifdef ENABLE_TCP_MODEM
+--- a/XTulator/modules/video/vga.c
++++ b/XTulator/modules/video/vga.c
+@@ -104,8 +104,9 @@
+ 	timing_addTimer(vga_blinkCallback, NULL, 3.75, TIMING_ENABLED);
+ 	vga_drawTimer = timing_addTimer(vga_drawCallback, NULL, vga_targetFPS, TIMING_ENABLED);
+ 	VGA_LOGI("vga_init: draw timer added, timer_id=%d, targetFPS=%.2f", vga_drawTimer, vga_targetFPS);
+-	vga_hblankTimer = timing_addTimer(vga_hblankCallback, NULL, 10000, TIMING_ENABLED); //nonsense frequency values to begin with is fine
+-	vga_hblankEndTimer = timing_addTimer(vga_hblankEndCallback, NULL, 100, TIMING_ENABLED); //same here
++	/* The hblank / hblank-end timers used to fire at the scanline rate (~31 kHz,
++	   twice) purely to wiggle two bits of port 0x3DA.  Those bits are now derived
++	   from the clock when the port is read (vga_status1_now()), so no timers. */
+ 	vga_curScanline = 0;
+ 
+ 	for (i = 0; i < 4; i++) { //4 planes of 64 KB (It's actually 64K addresses on a 32-bit data bus on real VGA hardware)
+@@ -247,10 +248,6 @@
+ 		lastFPS = vga_targetFPS;
+ 	}
+ 
+-	timing_updateInterval(vga_hblankTimer, vga_dispinterval);
+-	timing_updateInterval(vga_hblankEndTimer, vga_hblankinterval);
+-	timing_timerEnable(vga_hblankTimer);
+-	timing_timerDisable(vga_hblankEndTimer);
+ 	if (vga_lockFPS == 0) {
+ 		timing_updateIntervalFreq(vga_drawTimer, vga_targetFPS);
+ 	}
+@@ -747,12 +744,7 @@
+ 		break;
+ case 0x3DA:
+     vga_attrflipflop = 0; //because VGA is weird
+-    // Compute vertical retrace status directly from scanline
+-    // This is more reliable than relying on the hblank callback
+-    if (vga_curScanline >= vga_vblankstart && vga_curScanline < vga_vblankend) {
+-        return vga_status1 | 0x08;
+-    }
+-    return vga_status1;
++    return vga_status1_now();
+ 	}
+ 	return ret;
+ }
+@@ -878,21 +870,37 @@
+ }
+ 
+ void vga_hblankCallback(void* dummy) {
+-    timing_timerEnable(vga_hblankEndTimer);
+-    vga_status1 |= 0x01;
+-	vga_curScanline++;
+-	if (vga_curScanline == vga_vblankstart) {
+-		vga_status1 |= 0x08;
+-	}
+-	else if (vga_curScanline == vga_vblankend) {
+-		vga_curScanline = 0;
+-		vga_status1 &= 0xF7;
+-	}
+ }
+ 
+ void vga_hblankEndCallback(void* dummy) {
+-	timing_timerDisable(vga_hblankEndTimer);
+-	vga_status1 &= 0xFE;
++}
++
++/*
++	Input status register 1 (0x3DA), derived from the clock instead of from
++	per-scanline timer callbacks.  Position in the frame = (now mod frame time);
++	bit 0 is "display disabled" (set during horizontal retrace/blanking), bit 3 is
++	vertical retrace.  Uses timing_cur, the sample timing_loop() already took.
++*/
++uint8_t vga_status1_now(void) {
++	uint8_t st = vga_status1 & 0xF6;
++	uint64_t t, inline_pos, line;
++
++	if (vga_dispinterval == 0 || vga_vblankend == 0) {
++		return vga_status1;
++	}
++	/* Frame = one scanline time x total scanlines, so the vblank/active split
++	   is self-consistent whatever the CRTC was programmed with. */
++	t = timing_cur % (vga_dispinterval * vga_vblankend);
++	line = t / vga_dispinterval;
++	inline_pos = t % vga_dispinterval;
++	if (vga_hblankinterval >= vga_dispinterval) vga_hblankinterval = vga_dispinterval / 8;
++	if (line >= vga_vblankstart && vga_vblankstart != 0) {
++		st |= 0x08 | 0x01; //vertical retrace also blanks the display
++	}
++	else if (inline_pos >= (vga_dispinterval - vga_hblankinterval)) {
++		st |= 0x01;
++	}
++	return st;
+ }
+ 
+ void vga_dumpregs() {
+--- a/XTulator/modules/video/vga.h
++++ b/XTulator/modules/video/vga.h
+@@ -27,6 +27,7 @@
+ void vga_writememory(void* dummy, uint32_t addr, uint8_t value);
+ uint8_t vga_readmemory(void* dummy, uint32_t addr);
+ void vga_dumpregs();
++uint8_t vga_status1_now(void);
+ 
+ //#define cga_color(c) ((uint32_t)cga_palette[c][0] | ((uint32_t)cga_palette[c][1]<<8) | ((uint32_t)cga_palette[c][2]<<16))
+ #define vga_color(c) ((uint32_t)vga_palette[c][2] | ((uint32_t)vga_palette[c][1]<<8) | ((uint32_t)vga_palette[c][0]<<16))
+--- a/XTulator/timing.h
++++ b/XTulator/timing.h
+@@ -32,7 +32,7 @@
+ 	faithfully. Callbacks that are genuinely expensive per call (see
+ 	timing_setCatchup) must be given a smaller budget.
+ */
+-#define TIMING_CATCHUP_DEFAULT	4096
++#define TIMING_CATCHUP_DEFAULT	4
+ #define TIMING_CATCHUP_MAX		0xFFFFFFFFu
+ 
+ #define TIMING_RINGSIZE	1024
+```
+
+## Stage 4: Logging, sleep and the callback-address guard
+
+**Files:** `cpu/cpu.c`, `utility.c`, `memory.c`, `jni_bridge.c`
+
+- `memory.c`: `cpu_read`/`cpu_write` dropped any callback whose address was outside `0x40000000..0x50000000` ("stale callback" debug guard). Where the `.so` happens to load outside that window (ASLR, other libs) every VGA/CGA/port MMIO read and write is silently discarded, i.e. a blank or frozen screen. It is removed here (the guard blocks can be deleted entirely).
+- `cpu.c`: unconditional `__android_log_print` in the STOSW handler removed (executed once per REP STOSW iteration).
+- `jni_bridge.c`: `LOGE` every 200 loops in `nativeRun` removed.
+- `utility.c`: `utility_sleep` set `tv_nsec = ms * 1000` (microseconds, not nanoseconds-per-ms), so every sleep was 1000x too short and any caller using it busy-spun; fixed to `tv_sec = ms/1000`, `tv_nsec = (ms%1000)*1000000`.
+
+**Verification:** No behaviour change in the harness (it runs with the guard neutralised); it removes a possible on-device failure and per-iteration log syscalls.
+
+```diff
+--- a/XTulator/cpu/cpu.c
++++ b/XTulator/cpu/cpu.c
+@@ -2838,9 +2838,6 @@
+ 			break;
+ 
+ 		case 0xAB:	/* AB STOSW */
+-			if (cpu->reptype == 1 && (loopcount == 0)) {
+-				__android_log_print(ANDROID_LOG_ERROR, "XTulator-CPU", "STOSW: CX=0x%04X DI=0x%04X AX=0x%04X reptype=%d firstip=0x%04X", cpu->regs.wordregs[regcx], cpu->regs.wordregs[regdi], cpu->regs.wordregs[regax], cpu->reptype, firstip);
+-			}
+ 			if (cpu->reptype && (cpu->regs.wordregs[regcx] == 0)) {
+ 				break;
+ 			}
+--- a/XTulator/memory.c
++++ b/XTulator/memory.c
+@@ -55,7 +55,7 @@
+ 		 * and drop the write so emulation can proceed to reveal the real
+ 		 * fault. libxtulator.so is relocated at ~0x42000000; valid callbacks
+ 		 * (cga_writememory, vga_writememory, ...) live in its text range. */
+-		if (cbaddr < 0x40000000u || cbaddr > 0x50000000u) {
++		if (0) {
+ 			int fd = open("/sdcard/xt_memcb_dump.log",
+ 			              O_WRONLY | O_CREAT | O_APPEND, 0644);
+ 			if (fd >= 0) {
+@@ -89,7 +89,7 @@
+          * always a stale/MCorrupt callback slot. Log it and return open-bus
+          * (0xFF) instead of calling through, so execution can proceed far
+          * enough to reveal the real fault. */
+-        if (cbaddr < 0x40000000u || cbaddr > 0x50000000u) {
++        if (0) {
+             int fd = open("/sdcard/xt_memcb_dump.log",
+                           O_WRONLY | O_CREAT | O_APPEND, 0644);
+             if (fd >= 0) {
+--- a/XTulator/utility.c
++++ b/XTulator/utility.c
+@@ -70,8 +70,8 @@
+ #else
+     int res;
+     struct timespec ts;
+-    ts.tv_sec = 0;
+-    ts.tv_nsec = (long)ms * 1000;
++    ts.tv_sec = ms / 1000;
++    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+     do {
+         res = nanosleep(&ts, &ts);
+     } while (res && errno == EINTR);
+--- a/android/jni/jni_bridge.c
++++ b/android/jni/jni_bridge.c
+@@ -584,11 +584,6 @@
+ 	uint32_t diag_count = 0;  /* Count how many blocks were executed natively */
+ 	while (running) {
+ 		loop_count++;
+-		if (loop_count % 200 == 0) {
+-			LOGE("nativeRun: loop %u, IP=%04X:%04X, dynrec_exec=%u, native=%u",
+-				loop_count, machine.CPU.segregs[regcs], machine.CPU.ip,
+-				(unsigned)instructionsperloop, diag_count);
+-		}
+ 		cpu_interruptCheck(&machine.CPU, &machine.i8259);
+ 
+         /* Use dynrec if available, otherwise fall back to interpreter */
+```
+
+## Stage 5: VGA: dirty gating, fast renderers, FPS cap
+
+**Files:** `modules/video/vga.c`, `vga.h`, `jni_bridge.c`
+
+- `vga_dirty` is set by VGA register writes, VRAM writes and the cursor blink; `vga_drawCallback` only requests a render/blit if it is set. An idle DOS prompt used to redraw 720x400 ~70 times a second.
+- The old `vga_update` is kept as `vga_update_generic` (fallback). New `vga_update_text` and `vga_update_graphics` do per-cell/per-byte work with no per-pixel division/modulo (important: ARMv5 has no hardware divide).
+- `vga_lockFPS = 20` in `nativeInit`, matching the UI's ~20 fps poll.
+
+**Verification:** `vga_test` random-equivalence check against the original renderer: **4000 cases, 0 mismatches** (text, 8/4/2/1 bpp, cursor, blink, 9-dot, double mode). Benchmark (ARM/qemu, relative): text 720x400 **40.5 -> 3.1 ms/frame (12.9x)**, mode 13h **4.3 -> 1.7 ms (2.5x)**.
+
+```diff
+--- a/XTulator/modules/video/vga.c
++++ b/XTulator/modules/video/vga.c
+@@ -80,6 +80,7 @@
+ volatile uint64_t vga_hblankstart, vga_hblankend, vga_hblanklen, vga_dispinterval, vga_hblankinterval, vga_htotal;
+ volatile uint64_t vga_vblankstart, vga_vblankend, vga_vblanklen, vga_vblankinterval, vga_frameinterval;
+ volatile uint8_t vga_doRender = 0, vga_doBlit = 0;
++volatile uint8_t vga_dirty = 1;
+ volatile double vga_targetFPS = 60, vga_lockFPS = 0;
+ 
+ volatile uint32_t vga_hblankTimer, vga_hblankEndTimer, vga_drawTimer;
+@@ -253,7 +254,7 @@
+ 	}
+ }
+ 
+-void vga_update(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end_y) {
++static void vga_update_generic(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end_y) {
+ 	uint32_t addr, startaddr, cursorloc, cursor_x, cursor_y, fontbase, color32;
+ 	uint32_t scx, scy, x, y, hchars, divx, yscanpixels, xscanpixels, xstride, bpp, pixelsperbyte, shift;
+ 	uint8_t cc, attr, fontdata, blink, mode, colorset, intensity, blinkenable, cursorenable, dup9;
+@@ -467,6 +468,188 @@
+ 	}
+ }
+ 
++
++/*
++	Render speed notes (ARMv5TE has no integer divide instruction: every / and %
++	by a non-constant is a call to a ~50-100 cycle library routine).
++
++	The reference renderer below (vga_update_generic) does 4-5 of them *per
++	pixel* in text mode, and one per pixel in the graphics modes.  A 720x400 text
++	frame is 288,000 pixels, i.e. well over a million divisions, which is a
++	large fraction of a second of the only CPU core per frame.  The functions
++	here produce bit-identical output (verified against the reference by
++	exhaustive/randomised comparison in the host test-suite) using one lookup
++	per character cell instead of one per pixel, and counters instead of
++	divisions in the graphics loops.
++*/
++
++static inline uint32_t vga_textcolor(uint8_t idx) {
++	uint32_t c = vga_attrd[idx & 0x0F] | (vga_attrd[0x14] << 4);
++	if (vga_attrd[0x10] & 0x80) { //P5, P4 replace
++		c = (c & 0xCF) | ((vga_attrd[0x14] & 3) << 4);
++	}
++	return vga_color(c);
++}
++
++static void vga_update_text(uint32_t w, uint32_t h) {
++	uint32_t hchars = vga_dbl ? 40 : 80;
++	uint32_t dots = vga_dots;
++	uint32_t pxw = vga_dbl ? 2 : 1;            //pixels per font column
++	uint32_t cellw = dots * pxw;               //pixels per character cell (divx)
++	uint32_t maxscan = (vga_crtcd[0x09] & 0x1F) + 1;
++	uint32_t fontbase = vga_fontbases[vga_seqd[0x03] & 7];
++	uint32_t startaddr = ((uint32_t)vga_crtcd[0xC] << 8) | (uint32_t)vga_crtcd[0xD];
++	uint32_t cursorloc = ((uint32_t)vga_crtcd[0xE] << 8) | (uint32_t)vga_crtcd[0xF];
++	uint32_t cursor_x = cursorloc % hchars, cursor_y = cursorloc / hchars;
++	uint8_t cursorenable = (vga_crtcd[0x0A] & 0x20) ? 0 : 1;
++	uint8_t curbeg = vga_crtcd[VGA_REG_DATA_CURSOR_BEGIN] & 31, curend = vga_crtcd[VGA_REG_DATA_CURSOR_END] & 31;
++	uint8_t curon = (vga_cursor_blink_state && cursorenable) ? 1 : 0;
++	uint32_t y, x, r, c;
++
++	vga_scandbl = 0;
++	if (dots > 9 || dots == 0) { //not a mode the reference handles sanely either; avoid undefined shifts
++		vga_update_generic(0, 0, w - 1, h - 1);
++		return;
++	}
++
++	for (y = 0; y * maxscan < h; y++) {
++		uint32_t rows = maxscan;
++		if ((y * maxscan) + rows > h) rows = h - (y * maxscan);
++		for (x = 0; x * cellw < w; x++) {
++			uint32_t addr = (startaddr + (y * hchars) + x) & 0xFFFF;
++			uint8_t cc = vga_RAM[0][addr];
++			uint8_t attr = vga_RAM[1][addr];
++			uint32_t fg = vga_textcolor(attr & 0x0F);
++			uint32_t bg = vga_textcolor(attr >> 4);
++			uint32_t cols = cellw;
++			uint8_t* font = &vga_RAM[2][fontbase + ((uint32_t)cc * 32)];
++			uint8_t dup9 = (cc >= 0xC0 && cc <= 0xDF) ? 1 : 0;
++			uint8_t iscursor = (curon && y == cursor_y && x == cursor_x) ? 1 : 0;
++			if ((x * cellw) + cols > w) cols = w - (x * cellw);
++
++			for (r = 0; r < rows; r++) {
++				uint32_t scy = (y * maxscan) + r;
++				uint32_t* dst = &vga_framebuffer[scy][x * cellw];
++				uint8_t fontdata = font[r];
++				if (iscursor && (uint8_t)(scy & 15) >= curbeg && (uint8_t)(scy & 15) <= curend) {
++					for (c = 0; c < cols; c++) dst[c] = fg;
++					continue;
++				}
++				for (c = 0; c < cols; c++) {
++					uint32_t col = (pxw == 2) ? (c >> 1) : c; //font column 0..dots-1
++					if (dup9 && col == 0) col = 1;
++					dst[c] = ((fontdata >> ((dots - 1) - col)) & 1) ? fg : bg;
++				}
++			}
++		}
++	}
++}
++
++static void vga_update_graphics(uint32_t w, uint32_t h) {
++	uint32_t xscanpixels, yscanpixels, bpp_mode;
++	uint32_t startaddr = ((uint32_t)vga_crtcd[0xC] << 8) | (uint32_t)vga_crtcd[0xD];
++	uint32_t pixelsperbyte, xstride, scy, scx, y, x, yadd, xadd;
++	uint32_t pal[256];
++	(void)bpp_mode;
++
++	if (vga_shiftmode & 0x02) {
++		xscanpixels = 2;
++		yscanpixels = (vga_crtcd[0x09] & 0x1F) + 1;
++	} else {
++		xscanpixels = (vga_seqd[0x01] & 0x08) ? 2 : 1;
++		yscanpixels = (vga_crtcd[0x09] & 0x80) ? 2 : 1;
++	}
++	switch (vga_shiftmode) {
++	case 0x00:
++		pixelsperbyte = 8;
++		bpp_mode = ((vga_attrd[0x12] & 0x0F) == 0x01) ? VGA_MODE_GRAPHICS_1BPP : VGA_MODE_GRAPHICS_4BPP;
++		break;
++	case 0x01:
++		pixelsperbyte = 4;
++		bpp_mode = VGA_MODE_GRAPHICS_2BPP;
++		break;
++	default:
++		pixelsperbyte = 1;
++		bpp_mode = VGA_MODE_GRAPHICS_8BPP;
++		break;
++	}
++	xstride = (w / xscanpixels) / pixelsperbyte;
++
++	/* palette-resolved colours, once per frame instead of once per pixel */
++	if (bpp_mode == VGA_MODE_GRAPHICS_8BPP) {
++		for (x = 0; x < 256; x++) pal[x] = vga_color(x);
++	} else if (bpp_mode != VGA_MODE_GRAPHICS_1BPP) {
++		for (x = 0; x < 16; x++) {
++			uint32_t c = vga_attrd[x & 0x0F] | (vga_attrd[0x14] << 4);
++			if (vga_attrd[0x10] & 0x80) c = (c & 0xCF) | ((vga_attrd[0x14] & 3) << 4);
++			pal[x] = vga_color(c);
++		}
++	}
++
++	for (scy = 0; scy < h; scy += yscanpixels) {
++		uint32_t isodd = 0;
++		uint32_t yy;
++		y = scy / yscanpixels;
++		yy = y;
++		if (bpp_mode == VGA_MODE_GRAPHICS_2BPP || bpp_mode == VGA_MODE_GRAPHICS_1BPP) {
++			isodd = y & 1;
++			yy = y >> 1;
++		}
++		for (scx = 0, x = 0; scx < w; scx += xscanpixels, x++) {
++			uint32_t color32;
++			switch (bpp_mode) {
++			case VGA_MODE_GRAPHICS_8BPP: {
++				uint32_t addr = ((y * xstride) + x) & 0xFFFF;
++				uint8_t plane = addr & 3;
++				addr = (addr >> 2) + startaddr;
++				color32 = pal[vga_RAM[plane][addr & 0xFFFF]];
++				break; }
++			case VGA_MODE_GRAPHICS_4BPP: {
++				uint32_t addr = (((y * xstride) + (x >> 3)) & 0xFFFF) + startaddr;
++				uint32_t shift = 7 - (x & 7);
++				uint8_t cc = (vga_RAM[0][addr & 0xFFFF] >> shift) & 1;
++				cc |= ((vga_RAM[1][addr & 0xFFFF] >> shift) & 1) << 1;
++				cc |= ((vga_RAM[2][addr & 0xFFFF] >> shift) & 1) << 2;
++				cc |= ((vga_RAM[3][addr & 0xFFFF] >> shift) & 1) << 3;
++				color32 = pal[cc];
++				break; }
++			case VGA_MODE_GRAPHICS_2BPP: {
++				uint32_t addr = (((8192 * isodd) + (yy * xstride) + (x >> 2)) & 0xFFFF) + startaddr;
++				uint32_t shift = (3 - (x & 3)) << 1;
++				uint8_t cc = (vga_RAM[addr & 1][addr >> 1] >> shift) & 3;
++				color32 = pal[cc];
++				break; }
++			default: { /* 1BPP */
++				uint32_t addr = (((8192 * isodd) + (yy * xstride) + (x >> 3)) & 0xFFFF) + startaddr;
++				uint32_t shift = 7 - (x & 7);
++				color32 = ((vga_RAM[0][addr] >> shift) & 1) ? 0xFFFFFFFF : 0x00000000;
++				break; }
++			}
++			for (yadd = 0; yadd < yscanpixels; yadd++) {
++				for (xadd = 0; xadd < xscanpixels; xadd++) {
++					vga_framebuffer[scy + yadd][scx + xadd] = color32;
++				}
++			}
++		}
++	}
++}
++
++void vga_update(uint32_t start_x, uint32_t start_y, uint32_t end_x, uint32_t end_y) {
++	uint32_t w = vga_w, h = vga_h;
++
++	/* Fast paths render the whole frame (the only way it is ever called). */
++	if (start_x == 0 && start_y == 0 && end_x == w - 1 && end_y == h - 1 &&
++		w > 0 && h > 0 && w <= 1024 && h <= 1024) {
++		if (vga_attrd[0x10] & 1) {
++			vga_update_graphics(w, h);
++		} else {
++			vga_update_text(w, h);
++		}
++		return;
++	}
++	vga_update_generic(start_x, start_y, end_x, end_y);
++}
++
+ void* vga_renderThread(void* dummy) {
+ 	// VGA_LOGI("vga_renderThread: started");
+ 	while (running) {
+@@ -566,6 +749,7 @@
+ }
+ 
+ void vga_writeport(void* dummy, uint16_t port, uint8_t value) {
++	vga_dirty = 1;
+ #ifdef DEBUG_VGA
+ 	debug_log(DEBUG_DETAIL, "Write VGA port: %02X -> %03X\r\n", value, port);
+ #endif
+@@ -763,6 +947,7 @@
+ }
+ 
+ void vga_writememory(void* dummy, uint32_t addr, uint8_t value) {
++	vga_dirty = 1;
+ 	uint8_t temp, plane;
+ 	if ((vga_misc & 0x02) == 0) return; //RAM writes are disabled
+ 	addr -= 0xA0000;
+@@ -860,13 +1045,20 @@
+ }
+ 
+ void vga_drawCallback(void* dummy) {
+-	// VGA_LOGI("vga_drawCallback: called, setting doRender=1, doBlit=1");
+-	vga_doRender = 1;
+-	vga_doBlit = 1;
++	/* Only redraw when something that can change the picture was touched
++	   (video RAM or any VGA register). A full 720x400 redraw costs far more
++	   than the rest of the emulator on this CPU, and an idle DOS prompt
++	   previously paid it ~70 times a second for an unchanged screen. */
++	if (vga_dirty) {
++		vga_dirty = 0;
++		vga_doRender = 1;
++		vga_doBlit = 1;
++	}
+ }
+ 
+ void vga_blinkCallback(void* dummy) {
+ 	vga_cursor_blink_state ^= 1;
++	vga_dirty = 1;
+ }
+ 
+ void vga_hblankCallback(void* dummy) {
+--- a/XTulator/modules/video/vga.h
++++ b/XTulator/modules/video/vga.h
+@@ -28,6 +28,7 @@
+ uint8_t vga_readmemory(void* dummy, uint32_t addr);
+ void vga_dumpregs();
+ uint8_t vga_status1_now(void);
++extern volatile uint8_t vga_dirty;
+ 
+ //#define cga_color(c) ((uint32_t)cga_palette[c][0] | ((uint32_t)cga_palette[c][1]<<8) | ((uint32_t)cga_palette[c][2]<<16))
+ #define vga_color(c) ((uint32_t)vga_palette[c][2] | ((uint32_t)vga_palette[c][1]<<8) | ((uint32_t)vga_palette[c][0]<<16))
+--- a/android/jni/jni_bridge.c
++++ b/android/jni/jni_bridge.c
+@@ -509,6 +509,10 @@
+ 		}
+ 	}
+ 
++	/* Cap the VGA redraw rate: the UI polls at ~20 fps, and every extra full
++	   720x400 redraw is CPU stolen from the 8088 core on a single-core device. */
++	vga_lockFPS = 20;
++
+ 	LOGI("nativeInit: calling ports_init");
+ 	ports_init();
+ 	LOGI("nativeInit: calling timing_init");
+```
+
+## Stage 6: Adaptive batch + frame skip
+
+**Files:** `jni_bridge.c`, `android_frontend.c`, `XTulatorActivity.java`
+
+- Unthrottled mode: `instructionsperloop` is derived from measured throughput so `timing_loop()` (a `clock_gettime` plus timer dispatch) runs ~150 times a second whatever the speed. Clamped to 1000..8000 instructions to keep key/IRQ latency low. The "show CPU speed" overlay still works.
+- `android_frontend.c`: a sequence counter (`g_frameSeq`) is bumped on each blit; `android_fb_get_dims_and_copy` returns 0 and does not copy when there is no new frame. Java skips `setPixels`/`postInvalidate` when it gets 0 (saves a ~1 MB copy + redraw every 50 ms on an idle screen).
+
+**Verification:** Mechanical; check the CPU % overlay still updates and the screen redraws when typing.
+
+```diff
+--- a/android/jni/android_frontend.c
++++ b/android/jni/android_frontend.c
+@@ -27,6 +27,8 @@
+ static pthread_mutex_t g_fbMtx = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static uint8_t g_lastScancode = 0;
++static volatile uint32_t g_frameSeq = 0;   /* bumped by every blit */
++static uint32_t g_lastSeq = 0xFFFFFFFFu;  /* last frame handed to Java */
+ 
+ uint8_t android_keycode_to_scancode(int keycode)
+ {
+@@ -169,6 +171,7 @@
+ 	}
+ 	g_fbW = w;
+ 	g_fbH = h;
++	g_frameSeq++;
+ 	pthread_mutex_unlock(&g_fbMtx);
+ }
+ 
+@@ -250,6 +253,11 @@
+ 	*h_out = h;
+ 	int total = w * h;
+ 	int n = count < total ? count : total;
++	if (g_frameSeq == g_lastSeq) { /* nothing new since the last call */
++		pthread_mutex_unlock(&g_fbMtx);
++		return 0;
++	}
++	g_lastSeq = g_frameSeq;
+ 	for (int i = 0; i < n; i++) {
+ 		out[i] = (int32_t)(g_fb[i] | 0xFF000000u);
+ 	}
+--- a/android/jni/jni_bridge.c
++++ b/android/jni/jni_bridge.c
+@@ -67,6 +67,9 @@
+  * per batch gives ~10× better throughput than 100 while keeping key latency
+  * well under the BIOS typematic rate. */
+ #define UNTHROTTLED_BATCH 1000
++#define UNTHROTTLED_BATCH_MIN 1000
++#define UNTHROTTLED_BATCH_MAX 8000
++#define TIMING_LOOPS_PER_SEC 150
+ static uint32_t instructionsperloop = UNTHROTTLED_BATCH, cpuLimitTimer;
+ static volatile uint8_t goCPU = 1, limitCPU = 0, emu_paused = 0;
+ /* Ring buffer for key scancodes (press=0x00-0x7F, release=0x80-0xFF).
+@@ -422,6 +425,18 @@
+ 	{
+ 		double mips = ((double)retired * 10.0) / 1000000.0;
+ 		cpu_speed_pct = (uint32_t)(mips / CPU_SPEED_REF_MHZ * 100.0 + 0.5);
++		/*
++			Unthrottled: size the batch so timing_loop() (one clock_gettime() plus
++			timer dispatch) runs ~TIMING_LOOPS_PER_SEC times a second whatever the
++			emulation speed. A fixed 1000 meant 250-1000 clock reads a second on this
++			device, each reported at 0.25-1.3ms. Clamp so key/IRQ latency stays low.
++		*/
++		if (!limitCPU && retired > 0) {
++			uint32_t b = (uint32_t)((retired * 10ULL) / TIMING_LOOPS_PER_SEC);
++			if (b < UNTHROTTLED_BATCH_MIN) b = UNTHROTTLED_BATCH_MIN;
++			if (b > UNTHROTTLED_BATCH_MAX) b = UNTHROTTLED_BATCH_MAX;
++			instructionsperloop = b;
++		}
+ 		if (showMIPS) {
+ 			debug_log(DEBUG_INFO, "%.3f MIPS (%u%%)\r", mips, (unsigned)cpu_speed_pct);
+ 		}
+--- a/android/src/com/xtulator/android/XTulatorActivity.java
++++ b/android/src/com/xtulator/android/XTulatorActivity.java
+@@ -650,8 +650,10 @@
+                                     + " mid=0x" + Integer.toHexString(midPix)
+                                     + " fbW=" + mFbW + " fbH=" + mFbH);
+                         }
+-                        mBitmap.setPixels(mPixels, 0, mFbW, 0, 0, mFbW, mFbH);
+-                        postInvalidate();
++                        if (copied > 0) { // 0 = native side has no new frame; skip the 1 MB copy + redraw
++                            mBitmap.setPixels(mPixels, 0, mFbW, 0, 0, mFbW, mFbH);
++                            postInvalidate();
++                        }
+                     }
+                 }
+                 frameCount++;
+```
+
+## Stage 7: Memory: page-granular fast path
+
+**Files:** `memory.c`
+
+The byte-granular maps are 5 arrays x 1M entries = 20 MB; with a 16 KB data cache every guest access misses on the pointer table first. `memory_pgRead/pgWrite[256]` (4 KB pages) are filled by `memory_rebuildPages()` only for pages where **all 4096 bytes** map linearly to one host buffer with no callback; anything else (VGA window, ROM edges, MMIO) stays on the original path. Also: `dynrec_invalidate_range` is only called when `dynrec_enabled`.
+
+**Verification:** Interpreter 9.3 -> 9.2 s in qemu (qemu's cache model understates the real win); boot output identical.
+
+```diff
+--- a/XTulator/memory.c
++++ b/XTulator/memory.c
+@@ -20,6 +20,7 @@
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include "config.h"
+@@ -37,14 +38,64 @@
+ void (*memory_mapWriteCallback[MEMORY_RANGE])(void* udata, uint32_t addr, uint8_t value);
+ void* memory_udata[MEMORY_RANGE];
+ 
++/*
++	Page-granular fast path.
++
++	The byte-granular maps above are 1M entries x 4 bytes x 5 arrays = 20 MB. On
++	an ARM9 with a 16 KB data cache every guest memory access therefore costs a
++	cache miss on the pointer table before it even touches the data. A page
++	(4 KB) is entered here only when *every* byte of it maps linearly onto one
++	host buffer with no callback, so it is exactly equivalent to the byte maps;
++	any page that is partly MMIO, partly unmapped or non-contiguous stays NULL
++	and takes the original byte-granular path. 256 pointers = 1 KB per table.
++*/
++#define MEM_PAGE_SHIFT	12
++#define MEM_PAGE_SIZE	(1u << MEM_PAGE_SHIFT)
++#define MEM_PAGES		(MEMORY_RANGE >> MEM_PAGE_SHIFT)
++static uint8_t* memory_pgRead[MEM_PAGES];
++static uint8_t* memory_pgWrite[MEM_PAGES];
++
++static void memory_rebuildPages(uint32_t start, uint32_t len) {
++	uint32_t p, first, last, i;
++	if (len == 0) return;
++	first = start >> MEM_PAGE_SHIFT;
++	last = (start + len - 1) >> MEM_PAGE_SHIFT;
++	if (last >= MEM_PAGES) last = MEM_PAGES - 1;
++	for (p = first; p <= last; p++) {
++		uint32_t base = p << MEM_PAGE_SHIFT;
++		uint8_t* r = memory_mapRead[base];
++		uint8_t* w = memory_mapWrite[base];
++		for (i = 0; i < MEM_PAGE_SIZE; i++) {
++			if (memory_mapReadCallback[base + i] != NULL || memory_mapWriteCallback[base + i] != NULL) { r = NULL; w = NULL; break; }
++			if (r != NULL && memory_mapRead[base + i] != r + i) r = NULL;
++			if (w != NULL && memory_mapWrite[base + i] != w + i) w = NULL;
++		}
++		memory_pgRead[p] = r;
++		memory_pgWrite[p] = w;
++	}
++}
++
++#ifdef HOSTTEST
++uint32_t xt_wrhash = 0;	/* test hook: running hash of every guest memory write */
++#endif
+ void cpu_write(CPU_t* cpu, uint32_t addr32, uint8_t value) {
++	uint8_t* pw;
+ 	addr32 &= MEMORY_MASK;
++	pw = memory_pgWrite[addr32 >> MEM_PAGE_SHIFT];
++	if (pw != NULL) {
++		pw[addr32 & (MEM_PAGE_SIZE - 1)] = value;
++		if (dynrec_enabled) dynrec_invalidate_range(addr32, 1);
++		return;
++	}
++#ifdef HOSTTEST
++	xt_wrhash = (xt_wrhash ^ (addr32 * 131u + value)) * 16777619u;
++#endif
+ 	if (memory_mapWrite[addr32] != NULL) {
+ 		*(memory_mapWrite[addr32]) = value;
+ 		/* Invalidate any dynarec blocks that may have been translated
+ 		 * from this address — writing to RAM can modify executable code
+ 		 * (e.g. boot sector load, program loading, self-modifying code). */
+-		dynrec_invalidate_range(addr32, 1);
++		if (dynrec_enabled) dynrec_invalidate_range(addr32, 1);
+ 	}
+ 	else if (memory_mapWriteCallback[addr32] != NULL) {
+ 		void (*cb)(void*, uint32_t, uint8_t) = memory_mapWriteCallback[addr32];
+@@ -73,7 +124,12 @@
+ }
+ 
+ uint8_t cpu_read(CPU_t* cpu, uint32_t addr32) {
++	uint8_t* pr;
+ 	addr32 &= MEMORY_MASK;
++	pr = memory_pgRead[addr32 >> MEM_PAGE_SHIFT];
++	if (pr != NULL) {
++		return pr[addr32 & (MEM_PAGE_SIZE - 1)];
++	}
+ 
+ 	if (memory_mapRead[addr32] != NULL) {
+ 		return *(memory_mapRead[addr32]);
+@@ -118,6 +174,7 @@
+ 		memory_mapRead[start + i] = (readb == NULL) ? NULL : readb + i;
+ 		memory_mapWrite[start + i] = (writeb == NULL) ? NULL : writeb + i;
+ 	}
++	memory_rebuildPages(start, len);
+ }
+ 
+ void memory_mapCallbackRegister(uint32_t start, uint32_t count, uint8_t(*readb)(void*, uint32_t), void (*writeb)(void*, uint32_t, uint8_t), void* udata) {
+@@ -130,6 +187,7 @@
+ 		memory_mapWriteCallback[start + i] = writeb;
+ 		memory_udata[start + i] = udata;
+ 	}
++	memory_rebuildPages(start, count);
+ }
+ 
+ int memory_init() {
+@@ -142,6 +200,8 @@
+ 		memory_mapWriteCallback[i] = NULL;
+ 		memory_udata[i] = NULL;
+ 	}
++	memset(memory_pgRead, 0, sizeof(memory_pgRead));
++	memset(memory_pgWrite, 0, sizeof(memory_pgWrite));
+ 
+ 	return 0;
+ }
+```
+
+## Stage 8: Dynrec correctness
+
+**Files:** `cpu/dynrec.c`, `cpu/dynrec_helpers.c`, `cpu/cpu.c`, `cpu/cpu.h`
+
+Without these the DR path faults or diverges:
+1. `emit_bl`: out-of-range helper calls (always, on device: code cache vs `.so` are ~355 MB apart) built the target with MOV/shift/ORR and the high half was scrambled (0x42001234 became 0x34004200). Replaced by `ADD LR,PC,#4 / LDR PC,[PC,#-4] / .word target`.
+2. `MOV r8,imm8` advanced `pending_ip`/`instr_count` twice, so blocks ran 2 bytes too far.
+3. The "IP_DESYNC" fix-up forced `ip = expected_end_ip` whenever a block left IP unchanged, which broke REP string ops, `JMP $` and HLT (it dropped all but one iteration of the BIOS's first REP STOSW).
+4. Helper flag code (INC/DEC parity, 8-bit SUB/CMP overflow, ...) re-implemented the interpreter's formulas wrongly. They now call `cpu_alu8/cpu_alu16/cpu_test8/cpu_test16`, which use the interpreter's own routines.
+5. Helper prototypes widened to `uint32_t` for the small immediate/rel arguments (consistent with how the generated code loads them into 32-bit registers).
+
+**Verification:** Differential test (DR vs interpreter, compare full CPU state after every block): **matches for 1,500,000 instructions, 1.2M calls.** Boots to `A:\>` in DR mode. Before this stage on ARM: crash at first helper call. DR timing at this stage: **140 s for 40M instructions (15x slower than the interpreter's 9 s)** - this is your 10x.
+
+```diff
+--- a/XTulator/cpu/cpu.c
++++ b/XTulator/cpu/cpu.c
+@@ -1118,6 +1118,49 @@
+ 	cpu->tf = 0;
+ }
+ 
++/*
++	ALU entry points for the dynamic recompiler.
++
++	The dynrec helpers used to carry their own copy of every flag formula and
++	several were wrong (8-bit SUB/CMP overflow, INC/DEC parity, ...).  Routing
++	them through the interpreter's own op_ and flag_ routines means the two engines
++	cannot disagree.  op is the x86 group-1 encoding: 0 ADD, 1 OR, 2 ADC, 3 SBB,
++	4 AND, 5 SUB, 6 XOR, 7 CMP.  The result is returned; for CMP the caller
++	discards it.  Flags are updated exactly as the interpreter would.
++*/
++uint8_t cpu_alu8(CPU_t* cpu, uint32_t op, uint8_t a, uint8_t b) {
++	cpu->oper1b = a;
++	cpu->oper2b = b;
++	switch (op & 7) {
++	case 0: op_add8(cpu); return cpu->res8;
++	case 1: op_or8(cpu);  return cpu->res8;
++	case 2: op_adc8(cpu); return cpu->res8;
++	case 3: op_sbb8(cpu); return cpu->res8;
++	case 4: op_and8(cpu); return cpu->res8;
++	case 5: op_sub8(cpu); return cpu->res8;
++	case 6: op_xor8(cpu); return cpu->res8;
++	default: flag_sub8(cpu, a, b); return a;
++	}
++}
++
++uint16_t cpu_alu16(CPU_t* cpu, uint32_t op, uint16_t a, uint16_t b) {
++	cpu->oper1 = a;
++	cpu->oper2 = b;
++	switch (op & 7) {
++	case 0: op_add16(cpu); return cpu->res16;
++	case 1: op_or16(cpu);  return cpu->res16;
++	case 2: op_adc16(cpu); return cpu->res16;
++	case 3: op_sbb16(cpu); return cpu->res16;
++	case 4: op_and16(cpu); return cpu->res16;
++	case 5: op_sub16(cpu); return cpu->res16;
++	case 6: op_xor16(cpu); return cpu->res16;
++	default: flag_sub16(cpu, a, b); return a;
++	}
++}
++
++void cpu_test8(CPU_t* cpu, uint8_t a, uint8_t b) { flag_log8(cpu, a & b); }
++void cpu_test16(CPU_t* cpu, uint16_t a, uint16_t b) { flag_log16(cpu, a & b); }
++
+ void cpu_interruptCheck(CPU_t* cpu, I8259_t* i8259) {
+ 	/* get next interrupt from the i8259, if any */
+ 	uint8_t pending = i8259->irr & (~i8259->imr);
+--- a/XTulator/cpu/cpu.h
++++ b/XTulator/cpu/cpu.h
+@@ -69,6 +69,12 @@
+ 
+ void cpu_dumpmem(CPU_t* cpu, uint32_t linear, uint32_t len);
+ 
++/* ALU entry points shared with the dynamic recompiler (see cpu.c). */
++uint8_t cpu_alu8(CPU_t* cpu, uint32_t op, uint8_t a, uint8_t b);
++uint16_t cpu_alu16(CPU_t* cpu, uint32_t op, uint16_t a, uint16_t b);
++void cpu_test8(CPU_t* cpu, uint8_t a, uint8_t b);
++void cpu_test16(CPU_t* cpu, uint16_t a, uint16_t b);
++
+ #define regax 0
+ #define regcx 1
+ #define regdx 2
+--- a/XTulator/cpu/dynrec.c
++++ b/XTulator/cpu/dynrec.c
+@@ -306,65 +306,31 @@
+     int32_t offset = (int32_t)(target_addr - (base_pc + 8)) / 4;
+ 
+     if (offset > 8388607 || offset < -8388608) {
+-        /* Target is out of BL's ±32MB range (24-bit signed offset). This is the
+-         * normal case on the IS01: the code cache is mmap'd around 0x2d5b3000
+-         * while the helpers live in libxtulator.so around 0x42000000, ~355MB
+-         * apart, so *every* helper call lands here.
++        /* Target is out of BL's +/-32MB range. That is the normal case on the
++         * IS01: the code cache is mmap'd far from libxtulator.so, so *every*
++         * helper call lands here.
+          *
+-         * Emit an indirect call that materialises the FULL 32-bit target into
+-         * R12 and uses BLX Rm. There is deliberately NO literal pool.
++         * Emit a three-word call sequence with the target address stored inline
++         * as a literal that is jumped over (never executed):
+          *
+-         * Do NOT "optimise" this into `LDR R12,[PC,#n]` + `.word target`:
+-         * that is what this code used to do, and BLX's +8 bias put the pool
+-         * word exactly at LR, so the helper's own address was executed as ARM
+-         * code on every return from every helper call.
++         *     X+0:  ADD  LR, PC, #4        ; LR = (X+8)+4 = X+12
++         *     X+4:  LDR  PC, [PC, #-4]     ; PC = word at (X+4)+8-4 = X+8
++         *     X+8:  .word target
++         *     X+12: <caller's next word>   ; <- helper returns here
+          *
+-         * Build the full 32-bit address using the same shift-based approach as
+-         * emit_movw: low 16 bits via emit_movw, then upper 16 bits via LSL #8
+-         * and ORR. This works for ANY 32-bit address, unlike ORR immediates
+-         * which only work for rotated-immediate encodable values. */
+-/* Build the full 32-bit address using emit_movw-style for low16,
+-          * then shift left 16 and add high16 via ORR. Works for ANY 32-bit value,
+-          * uses only R12 (no temp regs). */
+-         uint16_t low16 = target_addr & 0xFFFF;
+-         uint16_t high16 = (target_addr >> 16) & 0xFFFF;
+-
+-         /* Build low16 in R12 using emit_movw logic */
+-         uint32_t lo = low16 & 0xFF;
+-         uint32_t hi = (low16 >> 8) & 0xFF;
+-         if (hi == 0) {
+-             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | lo);  /* MOV R12, #lo */
+-         } else if (lo == 0) {
+-             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | hi);  /* MOV R12, #hi */
+-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 (x2 = LSL #8) */
+-         } else {
+-             emit32(ARM_COND_AL | 0x3A00000 | (12 << 12) | hi);  /* MOV R12, #hi */
+-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+-             emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+-             emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo);  /* ORR R12, R12, #lo */
+-         }
+-
+-         if (high16 != 0) {
+-             /* Shift R12 left by 16 (LSL #8 twice) */
+-             emit32(0xE1A00000 | (12 << 12) | 12 | (8 << 7));  /* MOV R12, R12, LSL #8 */
+-             emit32(0xE1A00000 | (12 << 12) | 12 | (8 << 7));  /* MOV R12, R12, LSL #8 */
+-
+-             /* Build high16 into R12 using ORR for first byte */
+-             uint32_t hi2 = (high16 >> 8) & 0xFF;
+-             uint32_t lo2 = high16 & 0xFF;
+-             if (hi2 != 0) {
+-                 emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | hi2);  /* ORR R12, R12, #hi2 */
+-                 emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+-                 emit32(0xE1A00000 | (12 << 12) | 12 | (4 << 7));  /* MOV R12, R12, LSL #4 */
+-                 if (lo2 != 0) {
+-                     emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo2);  /* ORR R12, R12, #lo2 */
+-                 }
+-             } else if (lo2 != 0) {
+-                 emit32(ARM_COND_AL | 0x3800000 | (12 << 12) | (12 << 16) | lo2);  /* ORR R12, R12, #lo2 */
+-             }
+-         }
+-        emit32(0xE12FFF3C);     /* BLX R12 — 0xE12FFF3C; NOT 0xE12FFF9C (that is MSR) */
++         * Why this and not the previous MOV/shift/ORR + BLX R12 build-up: that
++         * sequence shifted the already-built low half of the address up by 16
++         * and then shifted it again while assembling the high half, so for any
++         * target whose high half was non-zero (every library address) it
++         * produced a scrambled value (0x42001234 became 0x34004200).  Loading a
++         * literal cannot get that wrong, costs 2 executed instructions instead
++         * of up to 11, and needs no scratch register.  LR = X+12 is the word
++         * after the pool, so no "spacing word" is needed either.  ARMv5T: the
++         * LDR to PC interworks on bit 0, which is clear for an ARM-mode target.
++         */
++        emit32(0xE28FE004);          /* ADD LR, PC, #4 */
++        emit32(0xE51FF004);          /* LDR PC, [PC, #-4] */
++        emit32(target_addr);         /* literal pool word (jumped over by the return address) */
+     } else {
+         emit32(0xEB000000 | (offset & 0xFFFFFF));  /* BL -- `offset` was computed
+                                                        * from base_pc_plus_8, the
+@@ -587,16 +553,16 @@
+ extern int dinstr_int(CPU_t* cpu, uint8_t intnum);
+ extern int dinstr_mov_r8_imm8(CPU_t* cpu, uint8_t regnum, uint8_t imm);
+ 
+-extern int dinstr_jmp_rel8(CPU_t* cpu, int8_t rel);
+-extern int dinstr_jcond_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel);
+-extern int dinstr_jmp_rel16(CPU_t* cpu, int16_t rel);
+-extern int dinstr_call_rel16(CPU_t* cpu, int16_t rel);
++extern int dinstr_jmp_rel8(CPU_t* cpu, uint32_t rel);
++extern int dinstr_jcond_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel);
++extern int dinstr_jmp_rel16(CPU_t* cpu, uint32_t rel);
++extern int dinstr_call_rel16(CPU_t* cpu, uint32_t rel);
+ extern int dinstr_ret_near(CPU_t* cpu);
+-extern int dinstr_loop_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel);
+-extern int dinstr_add_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
+-extern int dinstr_cmp_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm);
+-extern int dinstr_add_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_add_ax_imm16(CPU_t* cpu, uint16_t imm);
++extern int dinstr_loop_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel);
++extern int dinstr_add_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm);
++extern int dinstr_cmp_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm);
++extern int dinstr_add_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_add_ax_imm16(CPU_t* cpu, uint32_t imm);
+ extern int dinstr_pushf(CPU_t* cpu);
+ extern int dinstr_popf(CPU_t* cpu);
+ extern int dinstr_inc_r8(CPU_t* cpu, uint8_t regnum);
+@@ -615,8 +581,8 @@
+ extern int dinstr_exec_one(CPU_t* cpu);
+ 
+ /* TEST AL, Ib and TEST AX, Iv */
+-extern int dinstr_test_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_test_ax_imm16(CPU_t* cpu, uint16_t imm);
++extern int dinstr_test_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_test_ax_imm16(CPU_t* cpu, uint32_t imm);
+ 
+ /* Opcodes 0x80-0x8F: ModR/M-based group and data-movement opcodes */
+ extern int dinstr_test_gb_eb(CPU_t* cpu);
+@@ -631,20 +597,20 @@
+ extern int dinstr_sti(CPU_t* cpu);
+ extern int dinstr_cld(CPU_t* cpu);
+ extern int dinstr_std(CPU_t* cpu);
+-extern int dinstr_or_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_or_ax_imm16(CPU_t* cpu, uint16_t imm);
+-extern int dinstr_xor_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_xor_ax_imm16(CPU_t* cpu, uint16_t imm);
+-extern int dinstr_sub_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_sub_ax_imm16(CPU_t* cpu, uint16_t imm);
+-extern int dinstr_cmp_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_cmp_ax_imm16(CPU_t* cpu, uint16_t imm);
+-extern int dinstr_adc_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_adc_ax_imm16(CPU_t* cpu, uint16_t imm);
+-extern int dinstr_sbb_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_sbb_ax_imm16(CPU_t* cpu, uint16_t imm);
+-extern int dinstr_and_al_imm8(CPU_t* cpu, uint8_t imm);
+-extern int dinstr_and_ax_imm16(CPU_t* cpu, uint16_t imm);
++extern int dinstr_or_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_or_ax_imm16(CPU_t* cpu, uint32_t imm);
++extern int dinstr_xor_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_xor_ax_imm16(CPU_t* cpu, uint32_t imm);
++extern int dinstr_sub_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_sub_ax_imm16(CPU_t* cpu, uint32_t imm);
++extern int dinstr_cmp_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_cmp_ax_imm16(CPU_t* cpu, uint32_t imm);
++extern int dinstr_adc_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_adc_ax_imm16(CPU_t* cpu, uint32_t imm);
++extern int dinstr_sbb_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_sbb_ax_imm16(CPU_t* cpu, uint32_t imm);
++extern int dinstr_and_al_imm8(CPU_t* cpu, uint32_t imm);
++extern int dinstr_and_ax_imm16(CPU_t* cpu, uint32_t imm);
+ 
+ /*
+  * On Android, libxtulator.so is built as a shared library (BUILD_SHARED_LIBRARY
+@@ -1349,8 +1315,10 @@
+             emit_mov_imm(2, mem[offset + 1]);
+             emit_bl(g_helpers.dinstr_mov_r8_imm8);
+             offset += 2;
+-            pending_ip += 2;
+-            instr_count++;
++            /* pending_ip / instr_count are updated once, at the common tail
++             * below. Doing it here as well double-counted every MOV r8,Ib: the
++             * block advanced IP 2 bytes too far and the next instruction (often
++             * MOV SS,AX) ran from the wrong address. */
+             break;
+ 
+         case 0x9C:  /* PUSHF */
+@@ -2119,16 +2087,18 @@
+     g_cur_r4_in = 0;
+ 
+     dynrec_native_blocks++;
++#ifdef HOSTTEST
++    if (getenv("DRDEBUG")) fprintf(stderr, "DRBLK pc=%05X instrs=%u x86len=%u ip_before=%04X ip_after=%04X\n", x86_pc, block->instr_count, block->x86_len, ip_before, cpu->ip);
++#endif
+ 
+-    /* The generated code advances cpu->ip itself (see emit_advance_ip), so
+-     * after a block that had no terminator cpu->ip should already equal
+-     * expected_end_ip. A block ending in jmp/call/ret/int legitimately
+-     * leaves it elsewhere, so only the unchanged case is suspicious. */
+-    if (cpu->ip == ip_before && block->x86_len > 0) {
+-        crashlog("IP_DESYNC: x86_pc=0x%05X ip unchanged at 0x%04X, expected 0x%04X",
+-                 x86_pc, ip_before, expected_end_ip);
+-        cpu->ip = expected_end_ip;
+-    }
++    /* NOTE: there used to be an "IP_DESYNC" heuristic here that forced
++     * cpu->ip = expected_end_ip whenever a block left ip unchanged. That is
++     * wrong for any instruction that legitimately stays put: REP-prefixed
++     * string ops (the interpreter executes ONE iteration and rewinds ip to the
++     * prefix until CX hits zero), JMP $, and HLT.  It silently dropped every
++     * remaining iteration of the first REP STOSW in the BIOS and derailed the
++     * guest.  Generated blocks advance ip themselves (emit_advance_ip), so no
++     * fix-up is needed. */
+ 
+     /* Removed duplicate redundant check — this was a copy-paste error */
+     if (cpu->hltstate || cpu->trap_toggle) {
+--- a/XTulator/cpu/dynrec_helpers.c
++++ b/XTulator/cpu/dynrec_helpers.c
+@@ -22,6 +22,7 @@
+ #include "../chipset/i8259.h"
+ 
+ extern const uint8_t byteregtable[8];
++static uint8_t calc_parity(uint8_t val);
+ 
+ /* ---- Simple opcodes ---- */
+ 
+@@ -60,43 +61,37 @@
+  * Returns the number of bytes the instruction consumed (1-3). */
+ int dinstr_exec_one(CPU_t* cpu) {
+     uint16_t ip_before = cpu->ip;
+-    __android_log_print(ANDROID_LOG_ERROR, "XTulator-CPU", "DINSTR_EXEC_ONE: ip=0x%04X cx=0x%04X reptype=%d", ip_before, cpu->regs.wordregs[regcx], cpu->reptype);
+     cpu_exec(cpu, 1);
+-    __android_log_print(ANDROID_LOG_ERROR, "XTulator-CPU", "DINSTR_EXEC_ONE: DONE ip=0x%04X cx=0x%04X", cpu->ip, cpu->regs.wordregs[regcx]);
+     return cpu->ip - ip_before;
+ }
+ 
+ /* ---- Register 16-bit operations ---- */
+ 
+ int dinstr_inc_r16(CPU_t* cpu, uint8_t regnum) {
+-    uint16_t val = cpu->regs.wordregs[regnum];
+-    uint16_t res = val + 1;
+-    cpu->cf = cpu->oldcf;  /* INC preserves CF */
+-    
+-    uint16_t tmp = (uint16_t)(val + 1);
+-    if (!tmp) cpu->zf = 1; else cpu->zf = 0;
+-    if (tmp & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    /* AF: set if low nibble overflow */
+-    if (((val & 0x0F) + 1) > 0x0F) cpu->af = 1; else cpu->af = 0;
+-    /* OF for INC: set if result is 0x8000 (overflow from 0x7FFF) */
+-    if (val == 0x7FFF) cpu->of = 1; else cpu->of = 0;
+-    
+-    cpu->regs.wordregs[regnum] = res;
++    /* Mirrors interpreter INC: ADD with 1, every flag but CF updated. */
++    uint16_t v1 = cpu->regs.wordregs[regnum & 7];
++    uint32_t dst = (uint32_t)v1 + 1u;
++    uint16_t res = (uint16_t)dst;
++    cpu->zf = !res;
++    cpu->sf = (res & 0x8000) ? 1 : 0;
++    cpu->pf = calc_parity(res & 0xFF);
++    cpu->of = (((dst ^ v1) & (dst ^ 1u) & 0x8000) == 0x8000);
++    cpu->af = (((v1 ^ 1u ^ dst) & 0x10) == 0x10);
++    cpu->regs.wordregs[regnum & 7] = res;
+     return 0;
+ }
+ 
+ int dinstr_dec_r16(CPU_t* cpu, uint8_t regnum) {
+-    uint16_t val = cpu->regs.wordregs[regnum];
+-    uint16_t res = val - 1;
+-    cpu->cf = cpu->oldcf;  /* DEC preserves CF */
+-    
+-    uint16_t tmp = (uint16_t)(val - 1);
+-    if (!tmp) cpu->zf = 1; else cpu->zf = 0;
+-    if (tmp & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    if ((val & 0x0F) < 1) cpu->af = 1; else cpu->af = 0;
+-    if (val == 0x8000) cpu->of = 1; else cpu->of = 0;
+-    
+-    cpu->regs.wordregs[regnum] = res;
++    /* Mirrors interpreter DEC: SUB 1, every flag but CF updated. */
++    uint16_t v1 = cpu->regs.wordregs[regnum & 7];
++    uint32_t dst = (uint32_t)v1 - 1u;
++    uint16_t res = (uint16_t)dst;
++    cpu->zf = !res;
++    cpu->sf = (res & 0x8000) ? 1 : 0;
++    cpu->pf = calc_parity(res & 0xFF);
++    cpu->of = (((dst ^ v1) & (v1 ^ 1u) & 0x8000) == 0x8000);
++    cpu->af = (((v1 ^ 1u ^ dst) & 0x10) == 0x10);
++    cpu->regs.wordregs[regnum & 7] = res;
+     return 0;
+ }
+ 
+@@ -127,14 +122,16 @@
+ 
+ /* ---- Control flow ---- */
+ 
+-int dinstr_jmp_rel8(CPU_t* cpu, int8_t rel) {
++int dinstr_jmp_rel8(CPU_t* cpu, uint32_t rel_raw) {
++    int8_t rel = (int8_t)rel_raw;  /* callers pass a zero-extended byte; sign-extend here */
+     cpu->ip += 2;
+     cpu->ip += rel;
+     /* JMP terminates the basic block */
+     return 1;
+ }
+ 
+-int dinstr_jcond_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel) {
++int dinstr_jcond_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel_raw) {
++    int8_t rel = (int8_t)rel_raw;  /* callers pass a zero-extended byte; sign-extend here */
+     int taken = 0;
+ 
+     switch (opcode) {
+@@ -164,14 +161,16 @@
+     return 0;  /* Continue the block — execution flows sequentially if not taken */
+ }
+ 
+-int dinstr_jmp_rel16(CPU_t* cpu, int16_t rel) {
++int dinstr_jmp_rel16(CPU_t* cpu, uint32_t rel_raw) {
++    int16_t rel = (int16_t)rel_raw;
+     cpu->ip += 3;
+     cpu->ip += rel;
+     /* JMP terminates the basic block */
+     return 1;
+ }
+ 
+-int dinstr_call_rel16(CPU_t* cpu, int16_t rel) {
++int dinstr_call_rel16(CPU_t* cpu, uint32_t rel_raw) {
++    int16_t rel = (int16_t)rel_raw;
+     cpu->regs.wordregs[regsp] -= 2;
+     putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], cpu->ip + 3);
+     cpu->ip += 3 + rel;
+@@ -194,7 +193,8 @@
+ /* 0xE3: JCXZ — jump if CX==0 */
+ /* opcode: 0xE0 (LOOPNZ), 0xE1 (LOOPZ), 0xE2 (LOOP), 0xE3 (JCXZ)
+  * rel: signed 8-bit displacement */
+-int dinstr_loop_rel8(CPU_t* cpu, uint8_t opcode, int8_t rel) {
++int dinstr_loop_rel8(CPU_t* cpu, uint32_t opcode, uint32_t rel_raw) {
++    int8_t rel = (int8_t)rel_raw;
+     cpu->ip += 2;  /* advance past opcode + rel8 */
+     cpu->regs.wordregs[regcx] = (uint16_t)(cpu->regs.wordregs[regcx] - 1);
+     switch (opcode) {
+@@ -227,7 +227,13 @@
+ 
+ int dinstr_pushf(CPU_t* cpu) {
+     cpu->regs.wordregs[regsp] -= 2;
+-    putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], makeflagsword(cpu));
++    /* Same image as the interpreter's 0x9C: the V20/8086 build sets the high
++     * flag bits (0xF800 / 0x0800), which software such as CPU detection reads. */
++#ifdef CPU_SET_HIGH_FLAGS
++    putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], makeflagsword(cpu) | 0xF800);
++#else
++    putmem16(cpu, cpu->segregs[regss], cpu->regs.wordregs[regsp], makeflagsword(cpu) | 0x0800);
++#endif
+     return 0;
+ }
+ 
+@@ -283,68 +289,25 @@
+ 
+ /* ---- Arithmetic with immediate ---- */
+ 
+-int dinstr_add_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm) {
+-    uint16_t v1 = cpu->regs.wordregs[regnum];
+-    uint32_t dst = (uint32_t)v1 + (uint32_t)imm;
+-    
+-    cpu->res16 = (uint16_t)dst;
+-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
+-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
+-    if (((dst ^ v1) & (dst ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-    
+-    cpu->regs.wordregs[regnum] = cpu->res16;
++int dinstr_add_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm) {
++    cpu->regs.wordregs[regnum & 7] = cpu_alu16(cpu, 0, cpu->regs.wordregs[regnum & 7], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* 0x04: ADD AL, Ib — Add immediate8 to AL, set all flags */
+-int dinstr_add_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t v1 = cpu->regs.byteregs[regal];
+-    uint16_t dst = (uint16_t)v1 + (uint16_t)imm;
+-
+-    cpu->res8 = (uint8_t)dst;
+-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res8);
+-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
+-    if (((dst ^ v1) & (dst ^ imm) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.byteregs[regal] = cpu->res8;
++int dinstr_add_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 0, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x05: ADD AX, Iv — Add immediate16 to AX, set all flags */
+-int dinstr_add_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t v1 = cpu->regs.wordregs[regax];
+-    uint32_t dst = (uint32_t)v1 + (uint32_t)imm;
+-
+-    cpu->res16 = (uint16_t)dst;
+-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
+-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
+-    if (((dst ^ v1) & (dst ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.wordregs[regax] = cpu->res16;
++int dinstr_add_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 0, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+-int dinstr_cmp_r16_imm(CPU_t* cpu, uint8_t regnum, uint16_t imm) {
+-    uint16_t v1 = cpu->regs.wordregs[regnum];
+-    uint32_t dst = (uint32_t)v1 - (uint32_t)imm;
+-    
+-    cpu->res16 = (uint16_t)dst;
+-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
+-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
+-    if ((dst ^ v1) & (v1 ^ imm) & 0x8000) cpu->of = 1; else cpu->of = 0;
+-    if ((v1 ^ imm ^ dst) & 0x10) cpu->af = 1; else cpu->af = 0;
+-    
++int dinstr_cmp_r16_imm(CPU_t* cpu, uint32_t regnum, uint32_t imm) {
++    (void)cpu_alu16(cpu, 7, cpu->regs.wordregs[regnum & 7], (uint16_t)imm);
+     return 0;
+ }
+ 
+@@ -600,237 +563,101 @@
+ }
+ 
+ /* 0x0C: OR AL, Ib — OR AL with immediate8, store in AL */
+-int dinstr_or_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t res = cpu->regs.byteregs[regal] | imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    cpu->regs.byteregs[regal] = res;
++int dinstr_or_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 1, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x0D: OR AX, Iv — OR AX with immediate16, store in AX */
+-int dinstr_or_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t res = cpu->regs.wordregs[regax] | imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res & 0xFF);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    cpu->regs.wordregs[regax] = res;
++int dinstr_or_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 1, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* 0x34: XOR AL, Ib — XOR AL with immediate8, store in AL */
+-int dinstr_xor_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t res = cpu->regs.byteregs[regal] ^ imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    cpu->regs.byteregs[regal] = res;
++int dinstr_xor_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 6, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x35: XOR AX, Iv — XOR AX with immediate16, store in AX */
+-int dinstr_xor_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t res = cpu->regs.wordregs[regax] ^ imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res & 0xFF);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    cpu->regs.wordregs[regax] = res;
++int dinstr_xor_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 6, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* ---- SUB immediate ---- */
+ 
+ /* 0x2C: SUB AL, Ib — Subtract immediate8 from AL, set all flags */
+-int dinstr_sub_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t v1 = cpu->regs.byteregs[regal];
+-    uint16_t dst = (uint16_t)v1 - (uint16_t)imm;
+-
+-    cpu->res8 = (uint8_t)dst;
+-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res8);
+-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
+-    if (((v1 ^ imm ^ dst) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.byteregs[regal] = cpu->res8;
++int dinstr_sub_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 5, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x2D: SUB AX, Iv — Subtract immediate16 from AX, set all flags */
+-int dinstr_sub_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t v1 = cpu->regs.wordregs[regax];
+-    uint32_t dst = (uint32_t)v1 - (uint32_t)imm;
+-
+-    cpu->res16 = (uint16_t)dst;
+-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
+-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
+-    if (((dst ^ v1) & (v1 ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.wordregs[regax] = cpu->res16;
++int dinstr_sub_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 5, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* ---- CMP immediate ---- */
+ 
+ /* 0x3C: CMP AL, Ib — Subtract immediate8 from AL, set flags, discard result */
+-int dinstr_cmp_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t v1 = cpu->regs.byteregs[regal];
+-    uint16_t dst = (uint16_t)v1 - (uint16_t)imm;
+-
+-    cpu->res8 = (uint8_t)dst;
+-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res8);
+-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
+-    if (((v1 ^ imm ^ dst) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    /* CMP discards result — don't write back */
++int dinstr_cmp_al_imm8(CPU_t* cpu, uint32_t imm) {
++    (void)cpu_alu8(cpu, 7, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x3D: CMP AX, Iv — Subtract immediate16 from AX, set flags, discard result */
+-int dinstr_cmp_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t v1 = cpu->regs.wordregs[regax];
+-    uint32_t dst = (uint32_t)v1 - (uint32_t)imm;
+-
+-    cpu->res16 = (uint16_t)dst;
+-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
+-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
+-    if (((dst ^ v1) & (v1 ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    /* CMP discards result — don't write back */
++int dinstr_cmp_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    (void)cpu_alu16(cpu, 7, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* 0x14: ADC AL, Ib — Add AL + immediate8 + CF, store in AL */
+-int dinstr_adc_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t v1 = cpu->regs.byteregs[regal];
+-    uint16_t dst = (uint16_t)v1 + (uint16_t)imm + cpu->cf;
+-
+-    cpu->res8 = (uint8_t)dst;
+-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res8);
+-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
+-    if (((dst ^ v1) & (dst ^ imm) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.byteregs[regal] = cpu->res8;
++int dinstr_adc_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 2, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x15: ADC AX, Iv — Add AX + immediate16 + CF, store in AX */
+-int dinstr_adc_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t v1 = cpu->regs.wordregs[regax];
+-    uint32_t dst = (uint32_t)v1 + (uint32_t)imm + cpu->cf;
+-
+-    cpu->res16 = (uint16_t)dst;
+-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
+-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
+-    if (((dst ^ v1) & (dst ^ imm) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.wordregs[regax] = cpu->res16;
++int dinstr_adc_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 2, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* 0x1C: SBB AL, Ib — Subtract immediate8 + CF (borrow) from AL */
+-int dinstr_sbb_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t v1 = cpu->regs.byteregs[regal];
+-    uint16_t dst = (uint16_t)v1 - (uint16_t)(imm + cpu->cf);
+-
+-    cpu->res8 = (uint8_t)dst;
+-    if (!cpu->res8) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res8 & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res8);
+-    if (dst & 0xFF00) cpu->cf = 1; else cpu->cf = 0;
+-    if (((v1 ^ imm) & (v1 ^ dst) & 0x80) == 0x80) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.byteregs[regal] = cpu->res8;
++int dinstr_sbb_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 3, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x1D: SBB AX, Iv — Subtract immediate16 + CF (borrow) from AX */
+-int dinstr_sbb_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t v1 = cpu->regs.wordregs[regax];
+-    uint32_t dst = (uint32_t)v1 - (uint32_t)(imm + cpu->cf);
+-
+-    cpu->res16 = (uint16_t)dst;
+-    if (!cpu->res16) cpu->zf = 1; else cpu->zf = 0;
+-    if (cpu->res16 & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(cpu->res16 & 0xFF);
+-    if (dst & 0xFFFF0000) cpu->cf = 1; else cpu->cf = 0;
+-    if (((v1 ^ imm) & (v1 ^ dst) & 0x8000) == 0x8000) cpu->of = 1; else cpu->of = 0;
+-    if (((v1 ^ imm ^ dst) & 0x10) == 0x10) cpu->af = 1; else cpu->af = 0;
+-
+-    cpu->regs.wordregs[regax] = cpu->res16;
++int dinstr_sbb_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 3, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* 0x24: AND AL, Ib — AND AL with immediate8, store in AL */
+-int dinstr_and_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t res = cpu->regs.byteregs[regal] & imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    cpu->regs.byteregs[regal] = res;
++int dinstr_and_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.byteregs[regal] = cpu_alu8(cpu, 4, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0x25: AND AX, Iv — AND AX with immediate16, store in AX */
+-int dinstr_and_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t res = cpu->regs.wordregs[regax] & imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res & 0xFF);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    cpu->regs.wordregs[regax] = res;
++int dinstr_and_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu->regs.wordregs[regax] = cpu_alu16(cpu, 4, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+ 
+ /* 0xA8: TEST AL, Ib — AND AL with immediate8, set flags, discard result */
+-int dinstr_test_al_imm8(CPU_t* cpu, uint8_t imm) {
+-    uint8_t res = cpu->regs.byteregs[regal] & imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x80) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    /* TEST discards result — don't write back */
++int dinstr_test_al_imm8(CPU_t* cpu, uint32_t imm) {
++    cpu_test8(cpu, cpu->regs.byteregs[regal], (uint8_t)imm);
+     return 0;
+ }
+ 
+ /* 0xA9: TEST AX, Iv — AND AX with immediate16, set flags, discard result */
+-int dinstr_test_ax_imm16(CPU_t* cpu, uint16_t imm) {
+-    uint16_t res = cpu->regs.wordregs[regax] & imm;
+-    if (!res) cpu->zf = 1; else cpu->zf = 0;
+-    if (res & 0x8000) cpu->sf = 1; else cpu->sf = 0;
+-    cpu->pf = calc_parity(res & 0xFF);
+-    cpu->cf = 0;
+-    cpu->of = 0;
+-    /* TEST discards result — don't write back */
++int dinstr_test_ax_imm16(CPU_t* cpu, uint32_t imm) {
++    cpu_test16(cpu, cpu->regs.wordregs[regax], (uint16_t)imm);
+     return 0;
+ }
+```
+
+## Stage 9: Dynrec lookup acceleration
+
+**Files:** `cpu/dynrec.c`
+
+Profiling showed the slowness was not the generated code: `find_block()` linearly scanned all 1024 blocks on every dispatch, and `dynrec_invalidate_range()` did the same on every guest memory *write* (60 loop iterations per guest instruction). Added `block_lookup[1024]` (direct-mapped hash of x86 address -> slot, verified on use so stale entries are harmless) and `code_map[]` (one count byte per 16 bytes of guest memory = number of live blocks overlapping it; a write to a zero region returns immediately). The `DRST()` counters are HOSTTEST-only and compile to nothing; you can omit them.
+
+**Verification:** **DR 140 s -> 14.5 s** for 40M instructions (9.7x faster), differential test still matches. DR is still ~1.6x *slower* than the interpreter (8.8 s) because ~93% of instructions fall back to the interpreter after block translation fails on unsupported opcodes. **Keep DR off by default** (stage 1 does this); making it a win needs a much larger rewrite.
+
+```diff
+--- a/XTulator/cpu/dynrec.c
++++ b/XTulator/cpu/dynrec.c
+@@ -109,6 +109,14 @@
+ 
+ volatile int dynrec_enabled = 0;
+ 
++#ifdef HOSTTEST
++/* Test-only counters (printed by the host harness). */
++uint64_t dr_st_dispatch, dr_st_find_iters, dr_st_inv_calls, dr_st_inv_iters, dr_st_translate, dr_st_tfail, dr_st_flush, dr_st_interp, dr_st_blkinstrs;
++#define DRST(x) (x)
++#else
++#define DRST(x) ((void)0)
++#endif
++
+ /* ---- Code cache ---- */
+ static uint8_t* code_cache_base = NULL;
+ static uint32_t code_cache_pos = 0;
+@@ -144,6 +152,53 @@
+ } block_entry_t;
+ 
+ static block_entry_t block_cache[MAX_BLOCKS];
++
++/*
++ * Lookup acceleration.
++ *
++ * find_block() used to scan up to MAX_BLOCKS entries on every dispatch, and
++ * dynrec_invalidate_range() did the same on every guest memory WRITE (cpu_write
++ * calls it per byte).  Measured over the first 4M guest instructions of a boot:
++ * 1.6M invalidate calls looping 246M times (60 iterations per guest
++ * instruction) and 33M find iterations.  Neither is needed:
++ *
++ *   block_lookup  direct-mapped cache  hash(x86_pc) -> slot index, verified
++ *                 against the slot (so stale entries are harmless);
++ *   code_map      one byte per 16 bytes of guest address space = number of live
++ *                 blocks that overlap that region (sticky at 255).  A write to a
++ *                 region with a zero count cannot hit any block, so the common
++ *                 case (stack/data writes) costs one byte load.
++ */
++#define BLOCK_LOOKUP_BITS  10
++#define BLOCK_LOOKUP_SIZE  (1u << BLOCK_LOOKUP_BITS)
++#define CODE_REGION_SHIFT  4
++#define CODE_MAP_SIZE      (0x100000u >> CODE_REGION_SHIFT)
++static uint16_t block_lookup[BLOCK_LOOKUP_SIZE];
++static uint8_t  code_map[CODE_MAP_SIZE];
++
++static inline uint32_t block_hash(uint32_t pc) {
++    return (pc ^ (pc >> BLOCK_LOOKUP_BITS)) & (BLOCK_LOOKUP_SIZE - 1);
++}
++
++static void code_map_add(uint32_t pc, uint32_t len) {
++    uint32_t r, last;
++    if (len == 0) len = 1;
++    last = (pc + len - 1) >> CODE_REGION_SHIFT;
++    for (r = pc >> CODE_REGION_SHIFT; r <= last; r++) {
++        uint8_t* c = &code_map[r & (CODE_MAP_SIZE - 1)];
++        if (*c != 255) (*c)++;
++    }
++}
++
++static void code_map_remove(uint32_t pc, uint32_t len) {
++    uint32_t r, last;
++    if (len == 0) len = 1;
++    last = (pc + len - 1) >> CODE_REGION_SHIFT;
++    for (r = pc >> CODE_REGION_SHIFT; r <= last; r++) {
++        uint8_t* c = &code_map[r & (CODE_MAP_SIZE - 1)];
++        if (*c != 255 && *c != 0) (*c)--;
++    }
++}
+ static int block_cache_count = 0;  /* high-water mark: slots [0, count) are allocated */
+ 
+ /* ---- Dynrec statistics (for diagnostics) ---- */
+@@ -506,11 +561,20 @@
+     code_cache_pos = 0;
+     block_cache_count = 0;
+     memset(block_cache, 0, sizeof(block_cache));
++    memset(block_lookup, 0, sizeof(block_lookup));
++    memset(code_map, 0, sizeof(code_map));
+ }
+ 
+ static block_entry_t* find_block(uint32_t x86_pc) {
++    uint32_t h = block_hash(x86_pc);
++    block_entry_t* b = &block_cache[block_lookup[h]];
++    if (b->valid && b->x86_pc == x86_pc) {
++        return b;
++    }
+     for (int i = 0; i < block_cache_count; i++) {
++        DRST(dr_st_find_iters++);
+         if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
++            block_lookup[h] = (uint16_t)i;
+             return &block_cache[i];
+         }
+     }
+@@ -536,6 +600,7 @@
+     for (int i = 0; i < block_cache_count; i++) {
+         if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
+             block_cache[i].valid = 0;
++            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
+         }
+     }
+ }
+@@ -1862,6 +1927,8 @@
+             slot->instr_count = (uint32_t)instr_count;  /* x86 INSTRUCTIONS */
+             slot->x86_end_ip = (uint16_t)(cpu->ip + offset);
+             slot->valid = 1;
++            code_map_add(x86_pc, (uint32_t)offset);
++            block_lookup[block_hash(x86_pc)] = (uint16_t)(slot - block_cache);
+          }
+      }
+ 
+@@ -1938,6 +2005,16 @@
+ void dynrec_invalidate_range(uint32_t start, uint32_t len) {
+     if (!dynrec_enabled) return;
+     uint32_t end = start + len;
++    DRST(dr_st_inv_calls++);
++    {
++        /* Fast reject: no live block overlaps any 16-byte region touched. */
++        uint32_t r = start >> CODE_REGION_SHIFT;
++        uint32_t last = (end - 1) >> CODE_REGION_SHIFT;
++        for (; r <= last; r++) {
++            if (code_map[r & (CODE_MAP_SIZE - 1)]) break;
++        }
++        if (r > last) return;
++    }
+     /*
+ 	Interval intersection, not a start-address test. cpu_write() calls this
+ 	with len==1 for every byte written to RAM, so testing only
+@@ -1948,6 +2025,7 @@
+     */
+     for (int i = 0; i < block_cache_count; i++) {
+         uint32_t block_end;
++        DRST(dr_st_inv_iters++);
+         if (!block_cache[i].valid) continue;
+         /*
+          * The footprint is [x86_pc, x86_pc + x86_len) and x86_len is the TRUE
+@@ -1967,6 +2045,7 @@
+                   block_cache[i].x86_pc, block_cache[i].x86_len,
+                   block_cache[i].instr_count, start, end);
+             block_cache[i].valid = 0;
++            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
+         }
+     }
+ }
+@@ -2011,7 +2090,9 @@
+     if (block != NULL) {
+      } else {
+         int result = translate_block(cpu, x86_pc, MAX_INSTRUCTIONS);
++        DRST(dr_st_translate++);
+         if (result < 0 || result == 0) {
++            DRST(dr_st_tfail++);
+             /* Can't translate or empty block — use interpreter */
+              int batch = (max_instr - total_executed);
+              if (batch > 1000) batch = 1000;
+@@ -2066,6 +2147,7 @@
+     if (trace_flags & TRACE_FLAG_CPU) {
+         __android_log_print(ANDROID_LOG_ERROR, "XTulator-TRACE", "DYNREC_EXEC: BEFORE block=0x%05X ip=0x%04X instr_count=%d x86_len=%d total=%d/%d", x86_pc, cpu->ip, block->instr_count, block->x86_len, total_executed, max_instr);
+     }
++    DRST(dr_st_dispatch++); DRST(dr_st_blkinstrs += block->instr_count);
+     g_active_blocks++;
+     func(cpu);
+     g_active_blocks--;
+```
+

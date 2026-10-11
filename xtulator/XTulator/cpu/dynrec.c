@@ -95,7 +95,7 @@ static void crashlog(const char* fmt, ...) {}
 
 /* Reduced from 512KB to 256KB to fit within IS01's memory constraints */
 #define CODE_CACHE_SIZE    (256 * 1024)
-#define MAX_BLOCKS         1024
+#define MAX_BLOCKS         2048
 #define MAX_INSTRUCTIONS   128
 
 /*
@@ -169,16 +169,25 @@ static block_entry_t block_cache[MAX_BLOCKS];
  *                 region with a zero count cannot hit any block, so the common
  *                 case (stack/data writes) costs one byte load.
  */
-#define BLOCK_LOOKUP_BITS  10
+#define BLOCK_LOOKUP_BITS  12
 #define BLOCK_LOOKUP_SIZE  (1u << BLOCK_LOOKUP_BITS)
 #define CODE_REGION_SHIFT  4
 #define CODE_MAP_SIZE      (0x100000u >> CODE_REGION_SHIFT)
 static uint16_t block_lookup[BLOCK_LOOKUP_SIZE];
 static uint8_t  code_map[CODE_MAP_SIZE];
+static uint32_t block_alloc_hint;   /* round-robin start for alloc_block_slot() */
 
 static inline uint32_t block_hash(uint32_t pc) {
     return (pc ^ (pc >> BLOCK_LOOKUP_BITS)) & (BLOCK_LOOKUP_SIZE - 1);
 }
+/* 4-way set associative: a set is 4 consecutive block_lookup entries. A
+ * direct-mapped table made two hot blocks that hashed to the same bucket evict
+ * each other on every pass (one BIOS block was retranslated 44,000+ times). */
+#define BLOCK_WAYS 4
+static inline uint32_t block_set(uint32_t pc) {
+    return block_hash(pc) & ~(uint32_t)(BLOCK_WAYS - 1);
+}
+static uint8_t block_set_rr[BLOCK_LOOKUP_SIZE / BLOCK_WAYS];
 
 static void code_map_add(uint32_t pc, uint32_t len) {
     uint32_t r, last;
@@ -562,22 +571,23 @@ static void flush_all_blocks(void) {
     block_cache_count = 0;
     memset(block_cache, 0, sizeof(block_cache));
     memset(block_lookup, 0, sizeof(block_lookup));
+    memset(block_set_rr, 0, sizeof(block_set_rr));
+    block_alloc_hint = 0;
     memset(code_map, 0, sizeof(code_map));
 }
 
 static block_entry_t* find_block(uint32_t x86_pc) {
-    uint32_t h = block_hash(x86_pc);
-    block_entry_t* b = &block_cache[block_lookup[h]];
-    if (b->valid && b->x86_pc == x86_pc) {
-        return b;
-    }
-    for (int i = 0; i < block_cache_count; i++) {
-        DRST(dr_st_find_iters++);
-        if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
-            block_lookup[h] = (uint16_t)i;
-            return &block_cache[i];
+    uint32_t set = block_set(x86_pc);
+    uint32_t w;
+    for (w = 0; w < BLOCK_WAYS; w++) {
+        block_entry_t* b = &block_cache[block_lookup[set + w]];
+        if (b->valid && b->x86_pc == x86_pc) {
+            return b;
         }
     }
+    /* The sets are authoritative: every valid block is registered in its set
+     * when stored, so a miss here is a real miss (no linear scan). */
+    DRST(dr_st_find_iters++);
     return NULL;
 }
 
@@ -587,13 +597,34 @@ static block_entry_t* find_block(uint32_t x86_pc) {
 	flush point in translate_block() should prevent.
 */
 static block_entry_t* alloc_block_slot(void) {
-    for (int i = 0; i < block_cache_count; i++) {
+    /* Round-robin from the last position instead of rescanning from 0. */
+    for (int n = 0; n < block_cache_count; n++) {
+        uint32_t i = block_alloc_hint;
+        if (++block_alloc_hint >= (uint32_t)block_cache_count) block_alloc_hint = 0;
         if (!block_cache[i].valid) return &block_cache[i];
     }
     if (block_cache_count < MAX_BLOCKS) {
         return &block_cache[block_cache_count++];
     }
     return NULL;
+}
+
+/* Shadow copy of the guest bytes each block was translated from. A write only
+ * makes a block stale if the byte it stores actually differs from this copy.
+ * Without it, a guest that re-stores the same byte into a translated region
+ * (DOS/BIOS keeping variables next to code) invalidated and retranslated the
+ * block on every store: 0x9A12B was retranslated ~7,000 times in a 20M boot. */
+static uint8_t dr_shadow[MEMORY_RANGE];
+
+/* True if any byte in [start,end) differs from the shadow copy. */
+static int range_changed(uint32_t start, uint32_t end) {
+    uint32_t a;
+    for (a = start; a < end; a++) {
+        uint32_t idx = a & MEMORY_MASK;
+        uint8_t* p = memory_mapRead[idx];
+        if (p == NULL || *p != dr_shadow[idx]) return 1;
+    }
+    return 0;
 }
 
 static void invalidate_block(uint32_t x86_pc) {
@@ -1156,9 +1187,24 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
         start_pos = 0;
     }
 
-    /* Check if block cache is full */
+    /* Block table full. The table fills with blocks that were invalidated or
+     * are simply cold; refusing to translate then sent every later visit to a
+     * new address down the 1000-instruction interpreter batch path (measured:
+     * 17,000 of 18,000 translations in a boot). Reuse a dead slot if there is
+     * one, otherwise flush everything and start over (nothing is executing
+     * here, translation runs from the dispatcher between blocks). */
     if (block_cache_count >= MAX_BLOCKS) {
-        return -1;
+        int have_free = 0, bi;
+        for (bi = 0; bi < block_cache_count; bi++) {
+            if (!block_cache[bi].valid) { have_free = 1; break; }
+        }
+        if (!have_free) {
+            flush_all_blocks();
+            start_pos = 0;
+            if (block_cache_count >= MAX_BLOCKS) {
+                return -1;
+            }
+        }
     }
 
     /* Reset emit overflow flag for this translation */
@@ -1881,8 +1927,24 @@ static int translate_block(CPU_t* cpu, uint32_t x86_pc, int max_instr) {
             goto block_done;
 
         default:
-            /* Unsupported opcode — bail out to interpreter */
-            goto translate_fail;
+            /* Opcode with no native translation. This used to abandon the
+             * WHOLE block (discarding everything already emitted) and, since a
+             * failed translation is not remembered, every later visit to the
+             * address retried it and then ran a 1000-instruction interpreter
+             * batch. Instead:
+             *   - if the block already holds instructions, end it HERE (the
+             *     translated prefix is kept; this opcode starts the next block);
+             *   - otherwise hand just this one instruction to the interpreter
+             *     and end the block, exactly like the ModR/M cases above. */
+            if (instr_count > 0) {
+                goto block_done;
+            }
+            emit_mov_reg(0, 4);
+            emit_bl(g_helpers.dinstr_exec_one);
+            offset += (int)x86_instr_len(&mem[offset],
+                              MEMORY_RANGE - ((x86_pc + offset) & MEMORY_MASK));
+            instr_count++;
+            goto block_done;
         }
 
         if (emit32_failed) {
@@ -1927,8 +1989,31 @@ block_done:
             slot->instr_count = (uint32_t)instr_count;  /* x86 INSTRUCTIONS */
             slot->x86_end_ip = (uint16_t)(cpu->ip + offset);
             slot->valid = 1;
+            {
+                uint32_t set = block_set(x86_pc), w, pick = BLOCK_WAYS;
+                /* Take a free way (empty/stale entry or this slot itself),
+                 * otherwise evict round-robin so the table stays authoritative. */
+                for (w = 0; w < BLOCK_WAYS; w++) {
+                    block_entry_t* e = &block_cache[block_lookup[set + w]];
+                    if (e == slot || !e->valid || block_set(e->x86_pc) != set) { pick = w; break; }
+                }
+                if (pick == BLOCK_WAYS) {
+                    block_entry_t* victim;
+                    pick = block_set_rr[set / BLOCK_WAYS]++ & (BLOCK_WAYS - 1);
+                    victim = &block_cache[block_lookup[set + pick]];
+                    victim->valid = 0;
+                    code_map_remove(victim->x86_pc, victim->x86_len);
+                }
+                block_lookup[set + pick] = (uint16_t)(slot - block_cache);
+            }
+            {
+                /* Record the source bytes this block was built from (see dr_shadow). */
+                int k;
+                for (k = 0; k < offset; k++) {
+                    dr_shadow[(x86_pc + k) & MEMORY_MASK] = mem[k];
+                }
+            }
             code_map_add(x86_pc, (uint32_t)offset);
-            block_lookup[block_hash(x86_pc)] = (uint16_t)(slot - block_cache);
          }
      }
 
@@ -1937,8 +2022,8 @@ block_done:
      * execution site in dynrec_exec()). On ARMv5TE, cacheflush() is a
      * syscall; calling it per-block-execution was the dominant perf bug. */
     cacheflush((long)(code_cache_base + start_pos),
-                (long)(code_cache_pos),
-                0x3);
+                (long)(code_cache_base + code_cache_pos),
+                0);
 
     return instr_count;
 
@@ -2039,7 +2124,9 @@ void dynrec_invalidate_range(uint32_t start, uint32_t len) {
          * under-estimates.
          */
         block_end = block_cache[i].x86_pc + block_cache[i].x86_len;
-        if (block_cache[i].x86_pc < end && block_end > start) {
+        if (block_cache[i].x86_pc < end && block_end > start
+            && range_changed(start > block_cache[i].x86_pc ? start : block_cache[i].x86_pc,
+                             end < block_end ? end : block_end)) {
             DLOGI("invalidate: block at 0x%05X len=%u (instrs=%u) overlaps "
                   "write 0x%05X..0x%05X",
                   block_cache[i].x86_pc, block_cache[i].x86_len,

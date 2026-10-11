@@ -1,0 +1,20 @@
+--- a/XTulator/cpu/dynrec.c
++++ b/XTulator/cpu/dynrec.c
+@@ -1936,9 +1936,15 @@
+      * at translation time, NOT on every execution (see the comment at the
+      * execution site in dynrec_exec()). On ARMv5TE, cacheflush() is a
+      * syscall; calling it per-block-execution was the dominant perf bug. */
++    /* cacheflush(start, END ADDRESS, flags). The end must be an address, not an
++     * offset: passing the bare code_cache_pos (a small offset below `start`)
++     * made the syscall fail with EINVAL and flush nothing, so on real ARM
++     * hardware the I-cache kept stale lines and the CPU executed old or
++     * garbage code (instant crash on enabling DR). qemu-user has no I-cache,
++     * which is why host/qemu tests never showed it. */
+     cacheflush((long)(code_cache_base + start_pos),
+-                (long)(code_cache_pos),
+-                0x3);
++                (long)(code_cache_base + code_cache_pos),
++                0);
+ 
+     return instr_count;
+ 

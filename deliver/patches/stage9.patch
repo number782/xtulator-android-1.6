@@ -1,0 +1,160 @@
+--- a/XTulator/cpu/dynrec.c
++++ b/XTulator/cpu/dynrec.c
+@@ -109,6 +109,14 @@
+ 
+ volatile int dynrec_enabled = 0;
+ 
++#ifdef HOSTTEST
++/* Test-only counters (printed by the host harness). */
++uint64_t dr_st_dispatch, dr_st_find_iters, dr_st_inv_calls, dr_st_inv_iters, dr_st_translate, dr_st_tfail, dr_st_flush, dr_st_interp, dr_st_blkinstrs;
++#define DRST(x) (x)
++#else
++#define DRST(x) ((void)0)
++#endif
++
+ /* ---- Code cache ---- */
+ static uint8_t* code_cache_base = NULL;
+ static uint32_t code_cache_pos = 0;
+@@ -144,6 +152,53 @@
+ } block_entry_t;
+ 
+ static block_entry_t block_cache[MAX_BLOCKS];
++
++/*
++ * Lookup acceleration.
++ *
++ * find_block() used to scan up to MAX_BLOCKS entries on every dispatch, and
++ * dynrec_invalidate_range() did the same on every guest memory WRITE (cpu_write
++ * calls it per byte).  Measured over the first 4M guest instructions of a boot:
++ * 1.6M invalidate calls looping 246M times (60 iterations per guest
++ * instruction) and 33M find iterations.  Neither is needed:
++ *
++ *   block_lookup  direct-mapped cache  hash(x86_pc) -> slot index, verified
++ *                 against the slot (so stale entries are harmless);
++ *   code_map      one byte per 16 bytes of guest address space = number of live
++ *                 blocks that overlap that region (sticky at 255).  A write to a
++ *                 region with a zero count cannot hit any block, so the common
++ *                 case (stack/data writes) costs one byte load.
++ */
++#define BLOCK_LOOKUP_BITS  10
++#define BLOCK_LOOKUP_SIZE  (1u << BLOCK_LOOKUP_BITS)
++#define CODE_REGION_SHIFT  4
++#define CODE_MAP_SIZE      (0x100000u >> CODE_REGION_SHIFT)
++static uint16_t block_lookup[BLOCK_LOOKUP_SIZE];
++static uint8_t  code_map[CODE_MAP_SIZE];
++
++static inline uint32_t block_hash(uint32_t pc) {
++    return (pc ^ (pc >> BLOCK_LOOKUP_BITS)) & (BLOCK_LOOKUP_SIZE - 1);
++}
++
++static void code_map_add(uint32_t pc, uint32_t len) {
++    uint32_t r, last;
++    if (len == 0) len = 1;
++    last = (pc + len - 1) >> CODE_REGION_SHIFT;
++    for (r = pc >> CODE_REGION_SHIFT; r <= last; r++) {
++        uint8_t* c = &code_map[r & (CODE_MAP_SIZE - 1)];
++        if (*c != 255) (*c)++;
++    }
++}
++
++static void code_map_remove(uint32_t pc, uint32_t len) {
++    uint32_t r, last;
++    if (len == 0) len = 1;
++    last = (pc + len - 1) >> CODE_REGION_SHIFT;
++    for (r = pc >> CODE_REGION_SHIFT; r <= last; r++) {
++        uint8_t* c = &code_map[r & (CODE_MAP_SIZE - 1)];
++        if (*c != 255 && *c != 0) (*c)--;
++    }
++}
+ static int block_cache_count = 0;  /* high-water mark: slots [0, count) are allocated */
+ 
+ /* ---- Dynrec statistics (for diagnostics) ---- */
+@@ -506,11 +561,20 @@
+     code_cache_pos = 0;
+     block_cache_count = 0;
+     memset(block_cache, 0, sizeof(block_cache));
++    memset(block_lookup, 0, sizeof(block_lookup));
++    memset(code_map, 0, sizeof(code_map));
+ }
+ 
+ static block_entry_t* find_block(uint32_t x86_pc) {
++    uint32_t h = block_hash(x86_pc);
++    block_entry_t* b = &block_cache[block_lookup[h]];
++    if (b->valid && b->x86_pc == x86_pc) {
++        return b;
++    }
+     for (int i = 0; i < block_cache_count; i++) {
++        DRST(dr_st_find_iters++);
+         if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
++            block_lookup[h] = (uint16_t)i;
+             return &block_cache[i];
+         }
+     }
+@@ -536,6 +600,7 @@
+     for (int i = 0; i < block_cache_count; i++) {
+         if (block_cache[i].valid && block_cache[i].x86_pc == x86_pc) {
+             block_cache[i].valid = 0;
++            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
+         }
+     }
+ }
+@@ -1862,6 +1927,8 @@
+             slot->instr_count = (uint32_t)instr_count;  /* x86 INSTRUCTIONS */
+             slot->x86_end_ip = (uint16_t)(cpu->ip + offset);
+             slot->valid = 1;
++            code_map_add(x86_pc, (uint32_t)offset);
++            block_lookup[block_hash(x86_pc)] = (uint16_t)(slot - block_cache);
+          }
+      }
+ 
+@@ -1938,6 +2005,16 @@
+ void dynrec_invalidate_range(uint32_t start, uint32_t len) {
+     if (!dynrec_enabled) return;
+     uint32_t end = start + len;
++    DRST(dr_st_inv_calls++);
++    {
++        /* Fast reject: no live block overlaps any 16-byte region touched. */
++        uint32_t r = start >> CODE_REGION_SHIFT;
++        uint32_t last = (end - 1) >> CODE_REGION_SHIFT;
++        for (; r <= last; r++) {
++            if (code_map[r & (CODE_MAP_SIZE - 1)]) break;
++        }
++        if (r > last) return;
++    }
+     /*
+ 	Interval intersection, not a start-address test. cpu_write() calls this
+ 	with len==1 for every byte written to RAM, so testing only
+@@ -1948,6 +2025,7 @@
+     */
+     for (int i = 0; i < block_cache_count; i++) {
+         uint32_t block_end;
++        DRST(dr_st_inv_iters++);
+         if (!block_cache[i].valid) continue;
+         /*
+          * The footprint is [x86_pc, x86_pc + x86_len) and x86_len is the TRUE
+@@ -1967,6 +2045,7 @@
+                   block_cache[i].x86_pc, block_cache[i].x86_len,
+                   block_cache[i].instr_count, start, end);
+             block_cache[i].valid = 0;
++            code_map_remove(block_cache[i].x86_pc, block_cache[i].x86_len);
+         }
+     }
+ }
+@@ -2011,7 +2090,9 @@
+     if (block != NULL) {
+      } else {
+         int result = translate_block(cpu, x86_pc, MAX_INSTRUCTIONS);
++        DRST(dr_st_translate++);
+         if (result < 0 || result == 0) {
++            DRST(dr_st_tfail++);
+             /* Can't translate or empty block — use interpreter */
+              int batch = (max_instr - total_executed);
+              if (batch > 1000) batch = 1000;
+@@ -2066,6 +2147,7 @@
+     if (trace_flags & TRACE_FLAG_CPU) {
+         __android_log_print(ANDROID_LOG_ERROR, "XTulator-TRACE", "DYNREC_EXEC: BEFORE block=0x%05X ip=0x%04X instr_count=%d x86_len=%d total=%d/%d", x86_pc, cpu->ip, block->instr_count, block->x86_len, total_executed, max_instr);
+     }
++    DRST(dr_st_dispatch++); DRST(dr_st_blkinstrs += block->instr_count);
+     g_active_blocks++;
+     func(cpu);
+     g_active_blocks--;

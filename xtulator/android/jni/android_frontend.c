@@ -241,6 +241,16 @@ pthread_mutex_unlock(&g_fbMtx);
     return n;
 }
 
+/* Make the next android_fb_get_dims_and_copy() deliver the current frame even
+ * if nothing new was blitted (used when the Java side lost its bitmap, e.g.
+ * after the Activity was paused and resumed). */
+void android_fb_invalidate(void)
+{
+	pthread_mutex_lock(&g_fbMtx);
+	g_lastSeq = g_frameSeq - 1;
+	pthread_mutex_unlock(&g_fbMtx);
+}
+
 int android_fb_get_dims_and_copy(int *w_out, int *h_out, int32_t *out, int count)
 {
 	if (w_out == NULL || h_out == NULL || out == NULL || g_fb == NULL || count <= 0) {
