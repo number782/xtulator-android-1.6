@@ -749,6 +749,21 @@ JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetSpeed
 	return (jint)cpu_speed_pct;
 }
 
+/* Stage 25: which native core this .so was compiled for. */
+JNIEXPORT jstring JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetBuildArch(JNIEnv *env, jobject thiz) {
+	(void)thiz;
+#if defined(__ARM_ARCH_7A__) && defined(__ARM_NEON__)
+	const char *arch = "ARMv7-A + NEON (XT_ARMV7 build)";
+#elif defined(__ARM_ARCH_7A__)
+	const char *arch = "ARMv7-A";
+#elif defined(__ARM_ARCH_5TE__)
+	const char *arch = "ARMv5TE";
+#else
+	const char *arch = "other";
+#endif
+	return (*env)->NewStringUTF(env, arch);
+}
+
 JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetDynrecNativeBlocks(JNIEnv *env, jobject thiz) {
 	(void)env; (void)thiz;
 	return (jint)dynrec_get_native_block_count();
@@ -756,7 +771,7 @@ JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetDynre
 
 JNIEXPORT jint JNICALL Java_com_xtulator_android_XTulatorActivity_nativeGetDynrecInterpreterInstrs(JNIEnv *env, jobject thiz) {
 	(void)env; (void)thiz;
-#if defined(__ANDROID__) && defined(__ARM_ARCH_5TE__)
+#if defined(__ANDROID__) && defined(XT_ARM_JIT)
 	return (jint)(dynrec_get_interpreter_instr_count() & 0x7FFFFFFF);
 #else
 	return 0;

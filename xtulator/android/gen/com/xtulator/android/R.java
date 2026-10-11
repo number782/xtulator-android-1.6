@@ -14,6 +14,7 @@ public final class R {
         public static final int icon=0x7f020000;
     }
     public static final class id {
+        public static final int menu_about=0x7f06000a;
         public static final int menu_changedisk=0x7f060002;
         public static final int menu_dynrec=0x7f060000;
         public static final int menu_reset=0x7f060001;

@@ -1,5 +1,5 @@
 package com.xtulator.android;
 public final class BuildVersion {
-    public static final String BUILD_VERSION = "1.069A";
+    public static final String BUILD_VERSION = "1.072A";
     private BuildVersion() {}
 }

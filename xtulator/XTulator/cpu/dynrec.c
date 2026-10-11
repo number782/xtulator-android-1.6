@@ -102,7 +102,7 @@ static void crashlog(const char* fmt, ...) {}
 
 
 
-#ifdef __ARM_ARCH_5TE__
+#ifdef XT_ARM_JIT
 
 /* On ARMv5TE Linux/Android, cacheflush is a syscall, not a libc function.
  * The Android NDK declares it in <unistd.h> as:
@@ -2471,7 +2471,7 @@ uint64_t dynrec_get_interpreter_instr_count(void) {
     return dynrec_interpreter_instrs;
 }
 
-#else  /* !__ARM_ARCH_5TE__ */
+#else  /* !XT_ARM_JIT */
 
 volatile int dynrec_enabled = 0;
 

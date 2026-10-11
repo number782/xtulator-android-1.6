@@ -38,7 +38,20 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/../../XTulator
 
 # Stage 22 churn probe: to log block translate/evict/kill for 0x0660D-0x06629,
 # add -DDR_CHURN_PROBE to LOCAL_CFLAGS below (logcat tag XT-CHURN). Off by default.
-LOCAL_CFLAGS := -D__ANDROID__ -D__ARM_ARCH_5TE__ -O2 -g -std=gnu99
+LOCAL_CFLAGS := -D__ANDROID__ -O2 -g -std=gnu99
+
+# Stage 24: target-core selection. The IS01 is an ARMv7 Scorpion with NEON
+# (cpuinfo: implementer 0x51, part 0x00f). XT_ARMV7=1 builds for it:
+#   ndk-build XT_ARMV7=1      (or export XT_ARMV7=1 before build-apk.sh)
+# XT_ARMV7=0 (default) keeps the original ARMv5TE build for older devices.
+# No NEON code is generated here (-O2 does not auto-vectorise), so this
+# change only tests the core/ISA gain.
+XT_ARMV7 ?= 0
+ifeq ($(XT_ARMV7),1)
+LOCAL_CFLAGS += -march=armv7-a -mtune=cortex-a8 -mfpu=neon -mfloat-abi=softfp
+else
+LOCAL_CFLAGS += -march=armv5te
+endif
 
 LOCAL_ARM_MODE := arm
 

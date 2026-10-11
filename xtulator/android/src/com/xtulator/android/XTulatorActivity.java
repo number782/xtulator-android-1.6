@@ -35,6 +35,7 @@ public class XTulatorActivity extends Activity {
     private static final int BUFFER_SIZE = 4096;
 
     public native int nativeInit(String biosPath, String diskPath);
+    public native String nativeGetBuildArch();
     public native void nativeRun();
     public native void nativeStop();
     public native void nativeKeyDown(int keyCode);
@@ -241,6 +242,9 @@ public class XTulatorActivity extends Activity {
             nativeSetTraceFlag(TRACE_MISC, mTraceMisc);
             saveTraceSettings();
             return true;
+        } else if (item.getItemId() == R.id.menu_about) {
+            showAboutDialog();
+            return true;
         } else if (item.getItemId() == R.id.menu_trace_diag) {
             mTraceDiag = !mTraceDiag;
             item.setChecked(mTraceDiag);
@@ -251,6 +255,33 @@ public class XTulatorActivity extends Activity {
             return true;
         }
         return super.onMenuItemSelected(featureId, item);
+    }
+
+    /* About: build version, the core this build targets, and the CPU the
+     * phone reports (from /proc/cpuinfo). */
+    private void showAboutDialog() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Build: ").append(BuildVersion.BUILD_VERSION).append('\n');
+        sb.append("Native core: ").append(nativeGetBuildArch()).append('\n');
+        sb.append('\n');
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/cpuinfo"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("Processor") || line.startsWith("Features")
+                        || line.startsWith("Hardware") || line.startsWith("CPU part")) {
+                    sb.append(line).append('\n');
+                }
+            }
+            r.close();
+        } catch (java.io.IOException e) {
+            sb.append("cpuinfo unavailable: ").append(e.getMessage()).append('\n');
+        }
+        new android.app.AlertDialog.Builder(this)
+            .setTitle("About XTulator")
+            .setMessage(sb.toString())
+            .setPositiveButton("OK", null)
+            .show();
     }
 
     private void restoreTraceSettings() {

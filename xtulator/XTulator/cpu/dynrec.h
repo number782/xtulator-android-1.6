@@ -49,4 +49,10 @@ int dynrec_get_current_block(uint32_t *arm_off, uint32_t *code_len, uint32_t *x8
 int dynrec_get_current_entry(uint32_t *entry_cpu, uint32_t *caller_r4);
 int dynrec_get_guest_bytes(uint32_t x86_pc, uint32_t count, uint8_t *out);
 
+/* XT_ARM_JIT: the dynamic recompiler is built in. The JIT emits ARMv5TE code,
+ * which ARMv7 cores run too, so both targets enable it. */
+#if defined(__ARM_ARCH_5TE__) || defined(__ARM_ARCH_7A__)
+#define XT_ARM_JIT 1
+#endif
+
 #endif

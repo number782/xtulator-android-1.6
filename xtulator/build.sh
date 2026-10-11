@@ -10,7 +10,7 @@ echo "Building from VERSION=$PREV_VERSION"
 
 rm -f xtulator-debug.apk
 adb -s SSHEX010990 uninstall com.xtulator.android 2>/dev/null || true
-docker run --rm -v "$PWD":/src xtulator-android16 /bin/bash -c "cd /src && ./build-apk.sh"
+docker run --rm -e XT_ARMV7 -v "$PWD":/src xtulator-android16 /bin/bash -c "cd /src && ./build-apk.sh"
 
 # Show the new version
 NEW_VERSION=$(cat VERSION)
